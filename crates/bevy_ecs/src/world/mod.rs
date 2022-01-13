@@ -1142,6 +1142,28 @@ impl World {
         self.archetypes.clear_entities();
         self.entities.clear();
     }
+
+    /// Create a version of this [`World`] which can be sent to another thread
+    ///
+    /// # Panics
+    ///
+    /// If `self` contains any [`!Send`] resources, e.g. from calls to [`World::insert_non_send`]
+    ///
+    /// [`!Send`]: Send
+
+    pub fn turtle(self) -> Turtle {
+        let non_send = self.components().non_send_components().collect::<Vec<_>>();
+        for id in non_send {
+            assert!(
+                self.get_populated_resource_column(id).is_none(),
+                "Tried to create a Turtle from a World containing a !Send resource"
+            );
+        }
+        // Safety: this world does not contain anything !Send, as confirmed by the check above
+        // In practise this method is used for GLTF loading, which does not add any resources to the given world
+        // (i.e. the above check is trivially true)
+        Turtle { world: self }
+    }
 }
 
 impl fmt::Debug for World {
@@ -1159,8 +1181,49 @@ impl fmt::Debug for World {
     }
 }
 
-unsafe impl Send for World {}
 unsafe impl Sync for World {}
+
+/// A world which does not contain any [`!Send`] resources, and therefore
+/// can be safely sent between threads.
+///
+/// The name turtle is derived from this being something which is moving a
+/// [`World`] (between threads)
+///
+/// [`!Send`]: Send
+#[derive(Debug)]
+pub struct Turtle {
+    // Safety: does not have any !Send resources
+    world: World,
+}
+
+// Safety: The contained world does not contain anything which is !Send
+unsafe impl Send for Turtle {}
+
+impl Turtle {
+    /// The [`World`] this [`Turtle`] was created from.
+    ///
+    /// The returned [`World`] does not contain any [`!Send`] resources
+    ///
+    /// [`!Send`]: Send
+    pub fn world(self) -> World {
+        self.world
+    }
+
+    /// A view on this [`Turtle`]'s [`World`], which contains no [`!Send`] resources
+    ///
+    /// [`!Send`]: Send
+    // Safety: NonSend resources cannot be added using a shared reference
+    // to the world, so this cannot break our invariants
+    pub fn world_ref(&self) -> &World {
+        &self.world
+    }
+}
+
+impl From<Turtle> for World {
+    fn from(turtle: Turtle) -> Self {
+        turtle.world()
+    }
+}
 
 /// Creates `Self` using data from the given [World]
 pub trait FromWorld {
