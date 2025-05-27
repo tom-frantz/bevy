@@ -17,7 +17,7 @@ use core::time::Duration;
 /// (`ci_testing_config.ron` by default) and executes its specified actions. For a reference of the
 /// allowed configuration, see [`CiTestingConfig`].
 ///
-/// This plugin is included within `DefaultPlugins`, `HeadlessPlugins` and `MinimalPlugins`
+/// This plugin is included within `DefaultPlugins` and `MinimalPlugins`
 /// when the `bevy_ci_testing` feature is enabled.
 /// It is recommended to only used this plugin during testing (manual or
 /// automatic), and disable it during regular development and for production builds.
@@ -30,11 +30,12 @@ impl Plugin for CiTestingPlugin {
         let config: CiTestingConfig = {
             let filename = std::env::var("CI_TESTING_CONFIG")
                 .unwrap_or_else(|_| "ci_testing_config.ron".to_string());
-            ron::from_str(
-                &std::fs::read_to_string(filename)
-                    .expect("error reading CI testing configuration file"),
-            )
-            .expect("error deserializing CI testing configuration file")
+            std::fs::read_to_string(filename)
+                .map(|content| {
+                    ron::from_str(&content)
+                        .expect("error deserializing CI testing configuration file")
+                })
+                .unwrap_or_default()
         };
 
         #[cfg(target_arch = "wasm32")]
@@ -56,19 +57,19 @@ impl Plugin for CiTestingPlugin {
                 systems::send_events
                     .before(trigger_screenshots)
                     .before(bevy_window::close_when_requested)
-                    .in_set(SendEvents)
+                    .in_set(EventSenderSystems)
                     .ambiguous_with_all(),
             );
 
         // The offending system does not exist in the wasm32 target.
         // As a result, we must conditionally order the two systems using a system set.
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(unix, windows))]
         app.configure_sets(
             Update,
-            SendEvents.before(bevy_app::TerminalCtrlCHandlerPlugin::exit_on_flag),
+            EventSenderSystems.before(bevy_app::TerminalCtrlCHandlerPlugin::exit_on_flag),
         );
     }
 }
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
-struct SendEvents;
+struct EventSenderSystems;

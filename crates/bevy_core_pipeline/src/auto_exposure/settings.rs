@@ -3,8 +3,9 @@ use core::ops::RangeInclusive;
 use super::compensation_curve::AutoExposureCompensationCurve;
 use bevy_asset::Handle;
 use bevy_ecs::{prelude::Component, reflect::ReflectComponent};
+use bevy_image::Image;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
-use bevy_render::{extract_component::ExtractComponent, texture::Image};
+use bevy_render::{extract_component::ExtractComponent, view::Hdr};
 use bevy_utils::default;
 
 /// Component that enables auto exposure for an HDR-enabled 2d or 3d camera.
@@ -23,7 +24,8 @@ use bevy_utils::default;
 ///
 /// **Auto Exposure requires compute shaders and is not compatible with WebGL2.**
 #[derive(Component, Clone, Reflect, ExtractComponent)]
-#[reflect(Component, Default)]
+#[reflect(Component, Default, Clone)]
+#[require(Hdr)]
 pub struct AutoExposure {
     /// The range of exposure values for the histogram.
     ///
@@ -86,9 +88,6 @@ pub struct AutoExposure {
     /// For more information, see [`AutoExposureCompensationCurve`].
     pub compensation_curve: Handle<AutoExposureCompensationCurve>,
 }
-
-#[deprecated(since = "0.15.0", note = "Renamed to `AutoExposure`")]
-pub type AutoExposureSettings = AutoExposure;
 
 impl Default for AutoExposure {
     fn default() -> Self {

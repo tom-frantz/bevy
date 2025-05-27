@@ -1,13 +1,14 @@
 use bevy_reflect_derive::impl_type_path;
-use bevy_utils::all_tuples;
+use variadics_please::all_tuples;
 
 use crate::generics::impl_generic_info_methods;
 use crate::{
-    self as bevy_reflect, type_info::impl_type_methods, utility::GenericTypePathCell, ApplyError,
-    FromReflect, Generics, GetTypeRegistration, MaybeTyped, PartialReflect, Reflect, ReflectKind,
+    type_info::impl_type_methods, utility::GenericTypePathCell, ApplyError, FromReflect, Generics,
+    GetTypeRegistration, MaybeTyped, PartialReflect, Reflect, ReflectCloneError, ReflectKind,
     ReflectMut, ReflectOwned, ReflectRef, Type, TypeInfo, TypePath, TypeRegistration, TypeRegistry,
     Typed, UnnamedField,
 };
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::{
     any::Any,
     fmt::{Debug, Formatter},
@@ -54,8 +55,18 @@ pub trait Tuple: PartialReflect {
     /// Drain the fields of this tuple to get a vector of owned values.
     fn drain(self: Box<Self>) -> Vec<Box<dyn PartialReflect>>;
 
-    /// Clones the struct into a [`DynamicTuple`].
-    fn clone_dynamic(&self) -> DynamicTuple;
+    /// Creates a new [`DynamicTuple`] from this tuple.
+    fn to_dynamic_tuple(&self) -> DynamicTuple {
+        DynamicTuple {
+            represented_type: self.get_represented_type_info(),
+            fields: self.iter_fields().map(PartialReflect::to_dynamic).collect(),
+        }
+    }
+
+    /// Will return `None` if [`TypeInfo`] is not available.
+    fn get_represented_tuple_info(&self) -> Option<&'static TupleInfo> {
+        self.get_represented_type_info()?.as_tuple().ok()
+    }
 }
 
 /// An iterator over the field values of a tuple.
@@ -264,18 +275,6 @@ impl Tuple for DynamicTuple {
     fn drain(self: Box<Self>) -> Vec<Box<dyn PartialReflect>> {
         self.fields
     }
-
-    #[inline]
-    fn clone_dynamic(&self) -> DynamicTuple {
-        DynamicTuple {
-            represented_type: self.represented_type,
-            fields: self
-                .fields
-                .iter()
-                .map(|value| value.clone_value())
-                .collect(),
-        }
-    }
 }
 
 impl PartialReflect for DynamicTuple {
@@ -333,11 +332,6 @@ impl PartialReflect for DynamicTuple {
         ReflectOwned::Tuple(self)
     }
 
-    #[inline]
-    fn clone_value(&self) -> Box<dyn PartialReflect> {
-        Box::new(self.clone_dynamic())
-    }
-
     fn try_apply(&mut self, value: &dyn PartialReflect) -> Result<(), ApplyError> {
         tuple_try_apply(self, value)
     }
@@ -371,7 +365,7 @@ impl FromIterator<Box<dyn PartialReflect>> for DynamicTuple {
 
 impl IntoIterator for DynamicTuple {
     type Item = Box<dyn PartialReflect>;
-    type IntoIter = alloc::vec::IntoIter<Self::Item>;
+    type IntoIter = vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.fields.into_iter()
@@ -512,18 +506,6 @@ macro_rules! impl_reflect_tuple {
                     $(Box::new(self.$index),)*
                 ]
             }
-
-            #[inline]
-            fn clone_dynamic(&self) -> DynamicTuple {
-                let info = self.get_represented_type_info();
-                DynamicTuple {
-                    represented_type: info,
-                    fields: self
-                        .iter_fields()
-                        .map(|value| value.clone_value())
-                        .collect(),
-                }
-            }
         }
 
         impl<$($name: Reflect + MaybeTyped + TypePath + GetTypeRegistration),*> PartialReflect for ($($name,)*) {
@@ -572,10 +554,6 @@ macro_rules! impl_reflect_tuple {
                 ReflectOwned::Tuple(self)
             }
 
-            fn clone_value(&self) -> Box<dyn PartialReflect> {
-                Box::new(self.clone_dynamic())
-            }
-
             fn reflect_partial_eq(&self, value: &dyn PartialReflect) -> Option<bool> {
                 crate::tuple_partial_eq(self, value)
             }
@@ -586,6 +564,16 @@ macro_rules! impl_reflect_tuple {
 
             fn try_apply(&mut self, value: &dyn PartialReflect) -> Result<(), ApplyError> {
                 crate::tuple_try_apply(self, value)
+            }
+
+            fn reflect_clone(&self) -> Result<Box<dyn Reflect>, ReflectCloneError> {
+                Ok(Box::new((
+                    $(
+                        self.$index.reflect_clone()?
+                            .take::<$name>()
+                            .expect("`Reflect::reflect_clone` should return the same type"),
+                    )*
+                )))
             }
         }
 
@@ -692,6 +680,7 @@ macro_rules! impl_type_path_tuple {
         $(#[$meta])*
         impl <$param: TypePath> TypePath for ($param,) {
             fn type_path() -> &'static str {
+                use $crate::__macro_exports::alloc_utils::ToOwned;
                 static CELL: GenericTypePathCell = GenericTypePathCell::new();
                 CELL.get_or_insert::<Self, _>(|| {
                     "(".to_owned() + $param::type_path() + ",)"
@@ -699,6 +688,7 @@ macro_rules! impl_type_path_tuple {
             }
 
             fn short_type_path() -> &'static str {
+                use $crate::__macro_exports::alloc_utils::ToOwned;
                 static CELL: GenericTypePathCell = GenericTypePathCell::new();
                 CELL.get_or_insert::<Self, _>(|| {
                     "(".to_owned() + $param::short_type_path() + ",)"
@@ -711,6 +701,7 @@ macro_rules! impl_type_path_tuple {
         $(#[$meta])*
         impl <$($param: TypePath,)* $last: TypePath> TypePath for ($($param,)* $last) {
             fn type_path() -> &'static str {
+                use $crate::__macro_exports::alloc_utils::ToOwned;
                 static CELL: GenericTypePathCell = GenericTypePathCell::new();
                 CELL.get_or_insert::<Self, _>(|| {
                     "(".to_owned() $(+ $param::type_path() + ", ")* + $last::type_path() + ")"
@@ -718,6 +709,7 @@ macro_rules! impl_type_path_tuple {
             }
 
             fn short_type_path() -> &'static str {
+                use $crate::__macro_exports::alloc_utils::ToOwned;
                 static CELL: GenericTypePathCell = GenericTypePathCell::new();
                 CELL.get_or_insert::<Self, _>(|| {
                     "(".to_owned() $(+ $param::short_type_path() + ", ")* + $last::short_type_path() + ")"

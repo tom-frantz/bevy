@@ -2,7 +2,10 @@ use crate::MainWorld;
 use bevy_ecs::{
     component::Tick,
     prelude::*,
-    system::{ReadOnlySystemParam, SystemMeta, SystemParam, SystemParamItem, SystemState},
+    system::{
+        ReadOnlySystemParam, SystemMeta, SystemParam, SystemParamItem, SystemParamValidationError,
+        SystemState,
+    },
     world::unsafe_world_cell::UnsafeWorldCell,
 };
 use core::ops::{Deref, DerefMut};
@@ -30,11 +33,13 @@ use core::ops::{Deref, DerefMut};
 /// ```
 /// use bevy_ecs::prelude::*;
 /// use bevy_render::Extract;
+/// use bevy_render::sync_world::RenderEntity;
 /// # #[derive(Component)]
+/// // Do make sure to sync the cloud entities before extracting them.
 /// # struct Cloud;
-/// fn extract_clouds(mut commands: Commands, clouds: Extract<Query<Entity, With<Cloud>>>) {
+/// fn extract_clouds(mut commands: Commands, clouds: Extract<Query<RenderEntity, With<Cloud>>>) {
 ///     for cloud in &clouds {
-///         commands.get_or_spawn(cloud).insert(Cloud);
+///         commands.entity(cloud).insert(Cloud);
 ///     }
 /// }
 /// ```
@@ -77,14 +82,15 @@ where
     #[inline]
     unsafe fn validate_param(
         state: &Self::State,
-        system_meta: &SystemMeta,
+        _system_meta: &SystemMeta,
         world: UnsafeWorldCell,
-    ) -> bool {
+    ) -> Result<(), SystemParamValidationError> {
         // SAFETY: Read-only access to world data registered in `init_state`.
         let result = unsafe { world.get_resource_by_id(state.main_world_state) };
         let Some(main_world) = result else {
-            system_meta.try_warn_param::<&World>();
-            return false;
+            return Err(SystemParamValidationError::invalid::<Self>(
+                "`MainWorld` resource does not exist",
+            ));
         };
         // SAFETY: Type is guaranteed by `SystemState`.
         let main_world: &World = unsafe { main_world.deref() };

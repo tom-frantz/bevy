@@ -2,7 +2,7 @@
 
 use core::f32::consts::PI;
 
-use crate::{self as bevy_gizmos, primitives::dim3::GizmoPrimitive3d};
+use crate::primitives::dim3::GizmoPrimitive3d;
 
 use bevy_app::{Plugin, PostUpdate};
 use bevy_color::{
@@ -14,7 +14,7 @@ use bevy_ecs::{
     entity::Entity,
     query::Without,
     reflect::ReflectComponent,
-    schedule::IntoSystemConfigs,
+    schedule::IntoScheduleConfigs,
     system::{Query, Res},
 };
 use bevy_math::{
@@ -24,7 +24,7 @@ use bevy_math::{
 };
 use bevy_pbr::{DirectionalLight, PointLight, SpotLight};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
-use bevy_transform::{components::GlobalTransform, TransformSystem};
+use bevy_transform::{components::GlobalTransform, TransformSystems};
 
 use crate::{
     config::{GizmoConfigGroup, GizmoConfigStore},
@@ -41,20 +41,10 @@ fn point_light_gizmo(
 ) {
     let position = transform.translation();
     gizmos
-        .primitive_3d(
-            &Sphere {
-                radius: point_light.radius,
-            },
-            Isometry3d::from_translation(position),
-            color,
-        )
+        .primitive_3d(&Sphere::new(point_light.radius), position, color)
         .resolution(16);
     gizmos
-        .sphere(
-            Isometry3d::from_translation(position),
-            point_light.range,
-            color,
-        )
+        .sphere(position, point_light.range, color)
         .resolution(32);
 }
 
@@ -68,13 +58,7 @@ fn spot_light_gizmo(
 ) {
     let (_, rotation, translation) = transform.to_scale_rotation_translation();
     gizmos
-        .primitive_3d(
-            &Sphere {
-                radius: spot_light.radius,
-            },
-            Isometry3d::from_translation(translation),
-            color,
-        )
+        .primitive_3d(&Sphere::new(spot_light.radius), translation, color)
         .resolution(16);
 
     // Offset the tip of the cone to the light position.
@@ -142,13 +126,14 @@ impl Plugin for LightGizmoPlugin {
                         config.config::<LightGizmoConfigGroup>().1.draw_all
                     }),
                 )
-                    .after(TransformSystem::TransformPropagate),
+                    .after(TransformSystems::Propagate),
             );
     }
 }
 
 /// Configures how a color is attributed to a light gizmo.
 #[derive(Debug, Clone, Copy, Default, Reflect)]
+#[reflect(Clone, Default)]
 pub enum LightGizmoColor {
     /// User-specified color.
     Manual(Color),
@@ -163,6 +148,7 @@ pub enum LightGizmoColor {
 
 /// The [`GizmoConfigGroup`] used to configure the visualization of lights.
 #[derive(Clone, Reflect, GizmoConfigGroup)]
+#[reflect(Clone, Default)]
 pub struct LightGizmoConfigGroup {
     /// Draw a gizmo for all lights if true.
     ///

@@ -1,10 +1,11 @@
+use core::hint::black_box;
+
 use bevy_ecs::{
     component::Component,
-    entity::Entity,
-    system::Commands,
-    world::{Command, CommandQueue, World},
+    system::{Command, Commands},
+    world::{CommandQueue, World},
 };
-use criterion::{black_box, Criterion};
+use criterion::Criterion;
 
 #[derive(Component)]
 struct A;
@@ -35,7 +36,7 @@ pub fn spawn_commands(criterion: &mut Criterion) {
     group.warm_up_time(core::time::Duration::from_millis(500));
     group.measurement_time(core::time::Duration::from_secs(4));
 
-    for entity_count in (1..5).map(|i| i * 2 * 1000) {
+    for entity_count in [100, 1_000, 10_000] {
         group.bench_function(format!("{}_entities", entity_count), |bencher| {
             let mut world = World::default();
             let mut command_queue = CommandQueue::default();
@@ -51,6 +52,31 @@ pub fn spawn_commands(criterion: &mut Criterion) {
 
                     if black_box(i % 5 == 0) {
                         entity.despawn();
+                    }
+                }
+                command_queue.apply(&mut world);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+pub fn nonempty_spawn_commands(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("nonempty_spawn_commands");
+    group.warm_up_time(core::time::Duration::from_millis(500));
+    group.measurement_time(core::time::Duration::from_secs(4));
+
+    for entity_count in [100, 1_000, 10_000] {
+        group.bench_function(format!("{}_entities", entity_count), |bencher| {
+            let mut world = World::default();
+            let mut command_queue = CommandQueue::default();
+
+            bencher.iter(|| {
+                let mut commands = Commands::new(&mut command_queue, &world);
+                for i in 0..entity_count {
+                    if black_box(i % 2 == 0) {
+                        commands.spawn(A);
                     }
                 }
                 command_queue.apply(&mut world);
@@ -105,7 +131,7 @@ pub fn insert_commands(criterion: &mut Criterion) {
             for entity in &entities {
                 values.push((*entity, (Matrix::default(), Vec3::default())));
             }
-            commands.insert_or_spawn_batch(values);
+            commands.insert_batch(values);
             command_queue.apply(&mut world);
         });
     });
@@ -135,7 +161,7 @@ pub fn fake_commands(criterion: &mut Criterion) {
     group.warm_up_time(core::time::Duration::from_millis(500));
     group.measurement_time(core::time::Duration::from_secs(4));
 
-    for command_count in (1..5).map(|i| i * 2 * 1000) {
+    for command_count in [100, 1_000, 10_000] {
         group.bench_function(format!("{}_commands", command_count), |bencher| {
             let mut world = World::default();
             let mut command_queue = CommandQueue::default();
@@ -180,7 +206,7 @@ pub fn sized_commands_impl<T: Default + Command>(criterion: &mut Criterion) {
     group.warm_up_time(core::time::Duration::from_millis(500));
     group.measurement_time(core::time::Duration::from_secs(4));
 
-    for command_count in (1..5).map(|i| i * 2 * 1000) {
+    for command_count in [100, 1_000, 10_000] {
         group.bench_function(format!("{}_commands", command_count), |bencher| {
             let mut world = World::default();
             let mut command_queue = CommandQueue::default();
@@ -208,42 +234,4 @@ pub fn medium_sized_commands(criterion: &mut Criterion) {
 
 pub fn large_sized_commands(criterion: &mut Criterion) {
     sized_commands_impl::<SizedCommand<LargeStruct>>(criterion);
-}
-
-pub fn get_or_spawn(criterion: &mut Criterion) {
-    let mut group = criterion.benchmark_group("get_or_spawn");
-    group.warm_up_time(core::time::Duration::from_millis(500));
-    group.measurement_time(core::time::Duration::from_secs(4));
-
-    group.bench_function("individual", |bencher| {
-        let mut world = World::default();
-        let mut command_queue = CommandQueue::default();
-
-        bencher.iter(|| {
-            let mut commands = Commands::new(&mut command_queue, &world);
-            for i in 0..10_000 {
-                commands
-                    .get_or_spawn(Entity::from_raw(i))
-                    .insert((Matrix::default(), Vec3::default()));
-            }
-            command_queue.apply(&mut world);
-        });
-    });
-
-    group.bench_function("batched", |bencher| {
-        let mut world = World::default();
-        let mut command_queue = CommandQueue::default();
-
-        bencher.iter(|| {
-            let mut commands = Commands::new(&mut command_queue, &world);
-            let mut values = Vec::with_capacity(10_000);
-            for i in 0..10_000 {
-                values.push((Entity::from_raw(i), (Matrix::default(), Vec3::default())));
-            }
-            commands.insert_or_spawn_batch(values);
-            command_queue.apply(&mut world);
-        });
-    });
-
-    group.finish();
 }

@@ -15,6 +15,7 @@ use bevy::{
         dof::{self, DepthOfField, DepthOfFieldMode},
         tonemapping::Tonemapping,
     },
+    gltf::GltfMeshName,
     pbr::Lightmap,
     prelude::*,
     render::camera::PhysicalCameraParameters,
@@ -73,10 +74,6 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_settings: R
     let mut camera = commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(0.0, 4.5, 8.25).looking_at(Vec3::ZERO, Vec3::Y),
-        Camera {
-            hdr: true,
-            ..default()
-        },
         Tonemapping::TonyMcMapface,
         Bloom::NATURAL,
     ));
@@ -92,18 +89,15 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_settings: R
     )));
 
     // Spawn the help text.
-    commands.spawn(
-        TextBundle {
-            text: create_text(&app_settings),
-            ..default()
-        }
-        .with_style(Style {
+    commands.spawn((
+        create_text(&app_settings),
+        Node {
             position_type: PositionType::Absolute,
             bottom: Val::Px(12.0),
             left: Val::Px(12.0),
             ..default()
-        }),
-    );
+        },
+    ));
 }
 
 /// Adjusts the focal distance and f-number per user inputs.
@@ -189,7 +183,7 @@ fn tweak_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut lights: Query<&mut DirectionalLight, Changed<DirectionalLight>>,
     mut named_entities: Query<
-        (Entity, &Name, &MeshMaterial3d<StandardMaterial>),
+        (Entity, &GltfMeshName, &MeshMaterial3d<StandardMaterial>),
         (With<Mesh3d>, Without<Lightmap>),
     >,
 ) {
@@ -219,7 +213,7 @@ fn update_text(mut texts: Query<&mut Text>, app_settings: Res<AppSettings>) {
 
 /// Regenerates the app text component per the current app settings.
 fn create_text(app_settings: &AppSettings) -> Text {
-    Text::from_section(app_settings.help_text(), TextStyle::default())
+    app_settings.help_text().into()
 }
 
 impl From<AppSettings> for Option<DepthOfField> {

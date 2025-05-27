@@ -1,45 +1,52 @@
+#![expect(
+    clippy::module_inception,
+    reason = "The parent module contains all things viewport-related, while this module handles cameras as a component. However, a rename/refactor which should clear up this lint is being discussed; see #17196."
+)]
+use super::{ClearColorConfig, Projection};
 use crate::{
-    batching::gpu_preprocessing::GpuPreprocessingSupport,
+    batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
     camera::{CameraProjection, ManualTextureViewHandle, ManualTextureViews},
-    prelude::Image,
     primitives::Frustum,
     render_asset::RenderAssets,
     render_graph::{InternedRenderSubGraph, RenderSubGraph},
     render_resource::TextureView,
+    sync_world::{RenderEntity, SyncToRenderWorld},
     texture::GpuImage,
     view::{
-        ColorGrading, ExtractedView, ExtractedWindows, GpuCulling, Msaa, RenderLayers, Visibility,
-        VisibleEntities,
+        ColorGrading, ExtractedView, ExtractedWindows, Hdr, Msaa, NoIndirectDrawing, RenderLayers,
+        RenderVisibleEntities, RetainedViewEntity, ViewUniformOffset, Visibility, VisibleEntities,
     },
-    world_sync::{RenderEntity, SyncToRenderWorld},
     Extract,
 };
 use bevy_asset::{AssetEvent, AssetId, Assets, Handle};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     change_detection::DetectChanges,
-    component::{Component, ComponentId},
-    entity::Entity,
+    component::{Component, HookContext},
+    entity::{ContainsEntity, Entity},
     event::EventReader,
     prelude::With,
     query::Has,
     reflect::ReflectComponent,
-    system::{Commands, Query, Res, ResMut, Resource},
+    resource::Resource,
+    system::{Commands, Query, Res, ResMut},
     world::DeferredWorld,
 };
-use bevy_math::{ops, vec2, Dir3, Mat4, Ray3d, Rect, URect, UVec2, UVec4, Vec2, Vec3};
+use bevy_image::Image;
+use bevy_math::{ops, vec2, Dir3, FloatOrd, Mat4, Ray3d, Rect, URect, UVec2, UVec4, Vec2, Vec3};
+use bevy_platform::collections::{HashMap, HashSet};
 use bevy_reflect::prelude::*;
 use bevy_render_macros::ExtractComponent;
 use bevy_transform::components::{GlobalTransform, Transform};
-use bevy_utils::{tracing::warn, warn_once, HashMap, HashSet};
 use bevy_window::{
     NormalizedWindowRef, PrimaryWindow, Window, WindowCreated, WindowRef, WindowResized,
     WindowScaleFactorChanged,
 };
 use core::ops::Range;
+use derive_more::derive::From;
+use thiserror::Error;
+use tracing::warn;
 use wgpu::{BlendState, TextureFormat, TextureUsages};
-
-use super::{ClearColorConfig, Projection};
 
 /// Render viewport configuration for the [`Camera`] component.
 ///
@@ -47,7 +54,7 @@ use super::{ClearColorConfig, Projection};
 /// You can overlay multiple cameras in a single window using viewports to create effects like
 /// split screen, minimaps, and character viewers.
 #[derive(Reflect, Debug, Clone)]
-#[reflect(Default)]
+#[reflect(Default, Clone)]
 pub struct Viewport {
     /// The physical position to render this viewport to within the [`RenderTarget`] of this [`Camera`].
     /// (0,0) corresponds to the top-left corner
@@ -65,6 +72,42 @@ impl Default for Viewport {
             physical_position: Default::default(),
             physical_size: UVec2::new(1, 1),
             depth: 0.0..1.0,
+        }
+    }
+}
+
+impl Viewport {
+    /// Cut the viewport rectangle so that it lies inside a rectangle of the
+    /// given size.
+    ///
+    /// If either of the viewport's position coordinates lies outside the given
+    /// dimensions, it will be moved just inside first. If either of the given
+    /// dimensions is zero, the position and size of the viewport rectangle will
+    /// both be set to zero in that dimension.
+    pub fn clamp_to_size(&mut self, size: UVec2) {
+        // If the origin of the viewport rect is outside, then adjust so that
+        // it's just barely inside. Then, cut off the part that is outside.
+        if self.physical_size.x + self.physical_position.x > size.x {
+            if self.physical_position.x < size.x {
+                self.physical_size.x = size.x - self.physical_position.x;
+            } else if size.x > 0 {
+                self.physical_position.x = size.x - 1;
+                self.physical_size.x = 1;
+            } else {
+                self.physical_position.x = 0;
+                self.physical_size.x = 0;
+            }
+        }
+        if self.physical_size.y + self.physical_position.y > size.y {
+            if self.physical_position.y < size.y {
+                self.physical_size.y = size.y - self.physical_position.y;
+            } else if size.y > 0 {
+                self.physical_position.y = size.y - 1;
+                self.physical_size.y = 1;
+            } else {
+                self.physical_position.y = 0;
+                self.physical_size.y = 0;
+            }
         }
     }
 }
@@ -98,6 +141,7 @@ impl Default for Viewport {
 /// example have the following values:
 /// `full_size` = 32x18, `size` = 16x9, `offset` = 16,9
 #[derive(Debug, Clone, Copy, Reflect, PartialEq)]
+#[reflect(Clone, PartialEq, Default)]
 pub struct SubCameraView {
     /// Size of the entire camera view
     pub full_size: UVec2,
@@ -144,7 +188,7 @@ pub struct ComputedCameraValues {
 /// <https://en.wikipedia.org/wiki/Exposure_(photography)>
 #[derive(Component, Clone, Copy, Reflect)]
 #[reflect(opaque)]
-#[reflect(Component, Default)]
+#[reflect(Component, Default, Clone)]
 pub struct Exposure {
     /// <https://en.wikipedia.org/wiki/Exposure_value#Tabulated_exposure_values>
     pub ev100: f32,
@@ -243,7 +287,7 @@ impl Default for PhysicalCameraParameters {
 /// Error returned when a conversion between world-space and viewport-space coordinates fails.
 ///
 /// See [`world_to_viewport`][Camera::world_to_viewport] and [`viewport_to_world`][Camera::viewport_to_world].
-#[derive(Debug, Eq, PartialEq, Copy, Clone)]
+#[derive(Debug, Eq, PartialEq, Copy, Clone, Error)]
 pub enum ViewportConversionError {
     /// The pre-computed size of the viewport was not available.
     ///
@@ -253,18 +297,22 @@ pub enum ViewportConversionError {
     ///   - it references a [`Window`](RenderTarget::Window) entity that doesn't exist or doesn't actually have a `Window` component,
     ///   - it references an [`Image`](RenderTarget::Image) that doesn't exist (invalid handle),
     ///   - it references a [`TextureView`](RenderTarget::TextureView) that doesn't exist (invalid handle).
+    #[error("pre-computed size of viewport not available")]
     NoViewportSize,
     /// The computed coordinate was beyond the `Camera`'s near plane.
     ///
     /// Only applicable when converting from world-space to viewport-space.
+    #[error("computed coordinate beyond `Camera`'s near plane")]
     PastNearPlane,
     /// The computed coordinate was beyond the `Camera`'s far plane.
     ///
     /// Only applicable when converting from world-space to viewport-space.
+    #[error("computed coordinate beyond `Camera`'s far plane")]
     PastFarPlane,
     /// The Normalized Device Coordinates could not be computed because the `camera_transform`, the
     /// `world_position`, or the projection matrix defined by [`CameraProjection`] contained `NAN`
     /// (see [`world_to_ndc`][Camera::world_to_ndc] and [`ndc_to_world`][Camera::ndc_to_world]).
+    #[error("found NaN while computing NDC")]
     InvalidData,
 }
 
@@ -281,10 +329,10 @@ pub enum ViewportConversionError {
 /// but custom render graphs can also be defined. Inserting a [`Camera`] with no render
 /// graph will emit an error at runtime.
 ///
-/// [`Camera2d`]: https://docs.rs/crate/bevy_core_pipeline/latest/core_2d/struct.Camera2d.html
-/// [`Camera3d`]: https://docs.rs/crate/bevy_core_pipeline/latest/core_3d/struct.Camera3d.html
+/// [`Camera2d`]: https://docs.rs/bevy/latest/bevy/core_pipeline/core_2d/struct.Camera2d.html
+/// [`Camera3d`]: https://docs.rs/bevy/latest/bevy/core_pipeline/core_3d/struct.Camera3d.html
 #[derive(Component, Debug, Reflect, Clone)]
-#[reflect(Component, Default, Debug)]
+#[reflect(Component, Default, Debug, Clone)]
 #[component(on_add = warn_on_no_render_graph)]
 #[require(
     Frustum,
@@ -304,16 +352,13 @@ pub struct Camera {
     /// camera will not be rendered.
     pub is_active: bool,
     /// Computed values for this camera, such as the projection matrix and the render target size.
-    #[reflect(ignore)]
+    #[reflect(ignore, clone)]
     pub computed: ComputedCameraValues,
     /// The "target" that this camera will render to.
     pub target: RenderTarget,
-    /// If this is set to `true`, the camera will use an intermediate "high dynamic range" render texture.
-    /// This allows rendering with a wider range of lighting values.
-    pub hdr: bool,
     // todo: reflect this when #6042 lands
     /// The [`CameraOutputMode`] for this camera.
-    #[reflect(ignore)]
+    #[reflect(ignore, clone)]
     pub output_mode: CameraOutputMode,
     /// If this is enabled, a previous camera exists that shares this camera's render target, and this camera has MSAA enabled, then the previous camera's
     /// outputs will be written to the intermediate multi-sampled render target textures for this camera. This enables cameras with MSAA enabled to
@@ -326,9 +371,9 @@ pub struct Camera {
     pub sub_camera_view: Option<SubCameraView>,
 }
 
-fn warn_on_no_render_graph(world: DeferredWorld, entity: Entity, _: ComponentId) {
+fn warn_on_no_render_graph(world: DeferredWorld, HookContext { entity, caller, .. }: HookContext) {
     if !world.entity(entity).contains::<CameraRenderGraph>() {
-        warn!("Entity {entity} has a `Camera` component, but it doesn't have a render graph configured. Consider adding a `Camera2d` or `Camera3d` component, or manually adding a `CameraRenderGraph` component if you need a custom render graph.");
+        warn!("{}Entity {entity} has a `Camera` component, but it doesn't have a render graph configured. Consider adding a `Camera2d` or `Camera3d` component, or manually adding a `CameraRenderGraph` component if you need a custom render graph.", caller.map(|location|format!("{location}: ")).unwrap_or_default());
     }
 }
 
@@ -341,7 +386,6 @@ impl Default for Camera {
             computed: Default::default(),
             target: Default::default(),
             output_mode: Default::default(),
-            hdr: false,
             msaa_writeback: true,
             clear_color: Default::default(),
             sub_camera_view: None,
@@ -439,7 +483,10 @@ impl Camera {
 
     #[inline]
     pub fn target_scaling_factor(&self) -> Option<f32> {
-        self.computed.target_info.as_ref().map(|t| t.scale_factor)
+        self.computed
+            .target_info
+            .as_ref()
+            .map(|t: &RenderTargetInfo| t.scale_factor)
     }
 
     /// The projection matrix computed using this camera's [`CameraProjection`].
@@ -463,10 +510,10 @@ impl Camera {
         camera_transform: &GlobalTransform,
         world_position: Vec3,
     ) -> Result<Vec2, ViewportConversionError> {
-        let target_size = self
-            .logical_viewport_size()
+        let target_rect = self
+            .logical_viewport_rect()
             .ok_or(ViewportConversionError::NoViewportSize)?;
-        let ndc_space_coords = self
+        let mut ndc_space_coords = self
             .world_to_ndc(camera_transform, world_position)
             .ok_or(ViewportConversionError::InvalidData)?;
         // NDC z-values outside of 0 < z < 1 are outside the (implicit) camera frustum and are thus not in viewport-space
@@ -477,10 +524,12 @@ impl Camera {
             return Err(ViewportConversionError::PastFarPlane);
         }
 
-        // Once in NDC space, we can discard the z element and rescale x/y to fit the screen
-        let mut viewport_position = (ndc_space_coords.truncate() + Vec2::ONE) / 2.0 * target_size;
         // Flip the Y co-ordinate origin from the bottom to the top.
-        viewport_position.y = target_size.y - viewport_position.y;
+        ndc_space_coords.y = -ndc_space_coords.y;
+
+        // Once in NDC space, we can discard the z element and map x/y to the viewport rect
+        let viewport_position =
+            (ndc_space_coords.truncate() + Vec2::ONE) / 2.0 * target_rect.size() + target_rect.min;
         Ok(viewport_position)
     }
 
@@ -499,10 +548,10 @@ impl Camera {
         camera_transform: &GlobalTransform,
         world_position: Vec3,
     ) -> Result<Vec3, ViewportConversionError> {
-        let target_size = self
-            .logical_viewport_size()
+        let target_rect = self
+            .logical_viewport_rect()
             .ok_or(ViewportConversionError::NoViewportSize)?;
-        let ndc_space_coords = self
+        let mut ndc_space_coords = self
             .world_to_ndc(camera_transform, world_position)
             .ok_or(ViewportConversionError::InvalidData)?;
         // NDC z-values outside of 0 < z < 1 are outside the (implicit) camera frustum and are thus not in viewport-space
@@ -516,10 +565,12 @@ impl Camera {
         // Stretching ndc depth to value via near plane and negating result to be in positive room again.
         let depth = -self.depth_ndc_to_view_z(ndc_space_coords.z);
 
-        // Once in NDC space, we can discard the z element and rescale x/y to fit the screen
-        let mut viewport_position = (ndc_space_coords.truncate() + Vec2::ONE) / 2.0 * target_size;
         // Flip the Y co-ordinate origin from the bottom to the top.
-        viewport_position.y = target_size.y - viewport_position.y;
+        ndc_space_coords.y = -ndc_space_coords.y;
+
+        // Once in NDC space, we can discard the z element and map x/y to the viewport rect
+        let viewport_position =
+            (ndc_space_coords.truncate() + Vec2::ONE) / 2.0 * target_rect.size() + target_rect.min;
         Ok(viewport_position.extend(depth))
     }
 
@@ -539,15 +590,16 @@ impl Camera {
     pub fn viewport_to_world(
         &self,
         camera_transform: &GlobalTransform,
-        mut viewport_position: Vec2,
+        viewport_position: Vec2,
     ) -> Result<Ray3d, ViewportConversionError> {
-        let target_size = self
-            .logical_viewport_size()
+        let target_rect = self
+            .logical_viewport_rect()
             .ok_or(ViewportConversionError::NoViewportSize)?;
+        let mut rect_relative = (viewport_position - target_rect.min) / target_rect.size();
         // Flip the Y co-ordinate origin from the top to the bottom.
-        viewport_position.y = target_size.y - viewport_position.y;
-        let ndc = viewport_position * 2. / target_size - Vec2::ONE;
+        rect_relative.y = 1.0 - rect_relative.y;
 
+        let ndc = rect_relative * 2. - Vec2::ONE;
         let ndc_to_world =
             camera_transform.compute_matrix() * self.computed.clip_from_view.inverse();
         let world_near_plane = ndc_to_world.project_point3(ndc.extend(1.));
@@ -577,14 +629,17 @@ impl Camera {
     pub fn viewport_to_world_2d(
         &self,
         camera_transform: &GlobalTransform,
-        mut viewport_position: Vec2,
+        viewport_position: Vec2,
     ) -> Result<Vec2, ViewportConversionError> {
-        let target_size = self
-            .logical_viewport_size()
+        let target_rect = self
+            .logical_viewport_rect()
             .ok_or(ViewportConversionError::NoViewportSize)?;
+        let mut rect_relative = (viewport_position - target_rect.min) / target_rect.size();
+
         // Flip the Y co-ordinate origin from the top to the bottom.
-        viewport_position.y = target_size.y - viewport_position.y;
-        let ndc = viewport_position * 2. / target_size - Vec2::ONE;
+        rect_relative.y = 1.0 - rect_relative.y;
+
+        let ndc = rect_relative * 2. - Vec2::ONE;
 
         let world_near_plane = self
             .ndc_to_world(camera_transform, ndc.extend(1.))
@@ -691,7 +746,7 @@ impl Default for CameraOutputMode {
 /// Configures the [`RenderGraph`](crate::render_graph::RenderGraph) name assigned to be run for a given [`Camera`] entity.
 #[derive(Component, Debug, Deref, DerefMut, Reflect, Clone)]
 #[reflect(opaque)]
-#[reflect(Component, Debug)]
+#[reflect(Component, Debug, Clone)]
 pub struct CameraRenderGraph(InternedRenderSubGraph);
 
 impl CameraRenderGraph {
@@ -710,15 +765,42 @@ impl CameraRenderGraph {
 
 /// The "target" that a [`Camera`] will render to. For example, this could be a [`Window`]
 /// swapchain or an [`Image`].
-#[derive(Debug, Clone, Reflect)]
+#[derive(Debug, Clone, Reflect, From)]
+#[reflect(Clone)]
 pub enum RenderTarget {
     /// Window to which the camera's view is rendered.
     Window(WindowRef),
     /// Image to which the camera's view is rendered.
-    Image(Handle<Image>),
+    Image(ImageRenderTarget),
     /// Texture View to which the camera's view is rendered.
     /// Useful when the texture view needs to be created outside of Bevy, for example OpenXR.
     TextureView(ManualTextureViewHandle),
+}
+
+/// A render target that renders to an [`Image`].
+#[derive(Debug, Clone, Reflect, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[reflect(Clone, PartialEq, Hash)]
+pub struct ImageRenderTarget {
+    /// The image to render to.
+    pub handle: Handle<Image>,
+    /// The scale factor of the render target image, corresponding to the scale
+    /// factor for a window target. This should almost always be 1.0.
+    pub scale_factor: FloatOrd,
+}
+
+impl From<Handle<Image>> for RenderTarget {
+    fn from(handle: Handle<Image>) -> Self {
+        Self::Image(handle.into())
+    }
+}
+
+impl From<Handle<Image>> for ImageRenderTarget {
+    fn from(handle: Handle<Image>) -> Self {
+        Self {
+            handle,
+            scale_factor: FloatOrd(1.0),
+        }
+    }
 }
 
 impl Default for RenderTarget {
@@ -727,21 +809,16 @@ impl Default for RenderTarget {
     }
 }
 
-impl From<Handle<Image>> for RenderTarget {
-    fn from(handle: Handle<Image>) -> Self {
-        Self::Image(handle)
-    }
-}
-
 /// Normalized version of the render target.
 ///
 /// Once we have this we shouldn't need to resolve it down anymore.
-#[derive(Debug, Clone, Reflect, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Reflect, PartialEq, Eq, Hash, PartialOrd, Ord, From)]
+#[reflect(Clone, PartialEq, Hash)]
 pub enum NormalizedRenderTarget {
     /// Window to which the camera's view is rendered.
     Window(NormalizedWindowRef),
     /// Image to which the camera's view is rendered.
-    Image(Handle<Image>),
+    Image(ImageRenderTarget),
     /// Texture View to which the camera's view is rendered.
     /// Useful when the texture view needs to be created outside of Bevy, for example OpenXR.
     TextureView(ManualTextureViewHandle),
@@ -762,8 +839,8 @@ impl RenderTarget {
     /// Get a handle to the render target's image,
     /// or `None` if the render target is another variant.
     pub fn as_image(&self) -> Option<&Handle<Image>> {
-        if let Self::Image(handle) = self {
-            Some(handle)
+        if let Self::Image(image_target) = self {
+            Some(&image_target.handle)
         } else {
             None
         }
@@ -781,9 +858,9 @@ impl NormalizedRenderTarget {
             NormalizedRenderTarget::Window(window_ref) => windows
                 .get(&window_ref.entity())
                 .and_then(|window| window.swap_chain_texture_view.as_ref()),
-            NormalizedRenderTarget::Image(image_handle) => {
-                images.get(image_handle).map(|image| &image.texture_view)
-            }
+            NormalizedRenderTarget::Image(image_target) => images
+                .get(&image_target.handle)
+                .map(|image| &image.texture_view),
             NormalizedRenderTarget::TextureView(id) => {
                 manual_texture_views.get(id).map(|tex| &tex.texture_view)
             }
@@ -801,9 +878,9 @@ impl NormalizedRenderTarget {
             NormalizedRenderTarget::Window(window_ref) => windows
                 .get(&window_ref.entity())
                 .and_then(|window| window.swap_chain_texture_format),
-            NormalizedRenderTarget::Image(image_handle) => {
-                images.get(image_handle).map(|image| image.texture_format)
-            }
+            NormalizedRenderTarget::Image(image_target) => images
+                .get(&image_target.handle)
+                .map(|image| image.texture_format),
             NormalizedRenderTarget::TextureView(id) => {
                 manual_texture_views.get(id).map(|tex| tex.format)
             }
@@ -824,11 +901,11 @@ impl NormalizedRenderTarget {
                     physical_size: window.physical_size(),
                     scale_factor: window.resolution.scale_factor(),
                 }),
-            NormalizedRenderTarget::Image(image_handle) => {
-                let image = images.get(image_handle)?;
+            NormalizedRenderTarget::Image(image_target) => {
+                let image = images.get(&image_target.handle)?;
                 Some(RenderTargetInfo {
                     physical_size: image.size(),
-                    scale_factor: 1.0,
+                    scale_factor: image_target.scale_factor.0,
                 })
             }
             NormalizedRenderTarget::TextureView(id) => {
@@ -850,8 +927,8 @@ impl NormalizedRenderTarget {
             NormalizedRenderTarget::Window(window_ref) => {
                 changed_window_ids.contains(&window_ref.entity())
             }
-            NormalizedRenderTarget::Image(image_handle) => {
-                changed_image_handles.contains(&image_handle.id())
+            NormalizedRenderTarget::Image(image_target) => {
+                changed_image_handles.contains(&image_target.handle.id())
             }
             NormalizedRenderTarget::TextureView(_) => true,
         }
@@ -861,13 +938,7 @@ impl NormalizedRenderTarget {
 /// System in charge of updating a [`Camera`] when its window or projection changes.
 ///
 /// The system detects window creation, resize, and scale factor change events to update the camera
-/// projection if needed. It also queries any [`CameraProjection`] component associated with the same
-/// entity as the [`Camera`] one, to automatically update the camera projection matrix.
-///
-/// The system function is generic over the camera projection type, and only instances of
-/// [`OrthographicProjection`] and [`PerspectiveProjection`] are automatically added to
-/// the app, as well as the runtime-selected [`Projection`].
-/// The system runs during [`PostUpdate`](bevy_app::PostUpdate).
+/// [`Projection`] if needed.
 ///
 /// ## World Resources
 ///
@@ -876,8 +947,7 @@ impl NormalizedRenderTarget {
 ///
 /// [`OrthographicProjection`]: crate::camera::OrthographicProjection
 /// [`PerspectiveProjection`]: crate::camera::PerspectiveProjection
-#[allow(clippy::too_many_arguments)]
-pub fn camera_system<T: CameraProjection + Component>(
+pub fn camera_system(
     mut window_resized_events: EventReader<WindowResized>,
     mut window_created_events: EventReader<WindowCreated>,
     mut window_scale_factor_changed_events: EventReader<WindowScaleFactorChanged>,
@@ -886,11 +956,11 @@ pub fn camera_system<T: CameraProjection + Component>(
     windows: Query<(Entity, &Window)>,
     images: Res<Assets<Image>>,
     manual_texture_views: Res<ManualTextureViews>,
-    mut cameras: Query<(&mut Camera, &mut T)>,
+    mut cameras: Query<(&mut Camera, &mut Projection)>,
 ) {
     let primary_window = primary_window.iter().next();
 
-    let mut changed_window_ids = HashSet::new();
+    let mut changed_window_ids = <HashSet<_>>::default();
     changed_window_ids.extend(window_created_events.read().map(|event| event.window));
     changed_window_ids.extend(window_resized_events.read().map(|event| event.window));
     let scale_factor_changed_window_ids: HashSet<_> = window_scale_factor_changed_events
@@ -921,7 +991,7 @@ pub fn camera_system<T: CameraProjection + Component>(
                 || camera.computed.old_sub_camera_view != camera.sub_camera_view
             {
                 let new_computed_target_info = normalized_target.get_render_target_info(
-                    &windows,
+                    windows,
                     &images,
                     &manual_texture_views,
                 );
@@ -929,7 +999,9 @@ pub fn camera_system<T: CameraProjection + Component>(
                 // This can happen when the window is moved between monitors with different DPIs.
                 // Without this, the viewport will take a smaller portion of the window moved to
                 // a higher DPI monitor.
-                if normalized_target.is_changed(&scale_factor_changed_window_ids, &HashSet::new()) {
+                if normalized_target
+                    .is_changed(&scale_factor_changed_window_ids, &HashSet::default())
+                {
                     if let (Some(new_scale_factor), Some(old_scale_factor)) = (
                         new_computed_target_info
                             .as_ref()
@@ -949,26 +1021,25 @@ pub fn camera_system<T: CameraProjection + Component>(
                         }
                     }
                 }
-                // This check is needed because when changing WindowMode to SizedFullscreen, the viewport may have invalid
+                // This check is needed because when changing WindowMode to Fullscreen, the viewport may have invalid
                 // arguments due to a sudden change on the window size to a lower value.
                 // If the size of the window is lower, the viewport will match that lower value.
                 if let Some(viewport) = &mut camera.viewport {
                     let target_info = &new_computed_target_info;
                     if let Some(target) = target_info {
-                        if viewport.physical_size.x > target.physical_size.x {
-                            viewport.physical_size.x = target.physical_size.x;
-                        }
-                        if viewport.physical_size.y > target.physical_size.y {
-                            viewport.physical_size.y = target.physical_size.y;
-                        }
+                        viewport.clamp_to_size(target.physical_size);
                     }
                 }
                 camera.computed.target_info = new_computed_target_info;
                 if let Some(size) = camera.logical_viewport_size() {
-                    camera_projection.update(size.x, size.y);
-                    camera.computed.clip_from_view = match &camera.sub_camera_view {
-                        Some(sub_view) => camera_projection.get_clip_from_view_for_sub(sub_view),
-                        None => camera_projection.get_clip_from_view(),
+                    if size.x != 0.0 && size.y != 0.0 {
+                        camera_projection.update(size.x, size.y);
+                        camera.computed.clip_from_view = match &camera.sub_camera_view {
+                            Some(sub_view) => {
+                                camera_projection.get_clip_from_view_for_sub(sub_view)
+                            }
+                            None => camera_projection.get_clip_from_view(),
+                        }
                     }
                 }
             }
@@ -987,7 +1058,7 @@ pub fn camera_system<T: CameraProjection + Component>(
 /// This component lets you control the [`TextureUsages`] field of the main texture generated for the camera
 #[derive(Component, ExtractComponent, Clone, Copy, Reflect)]
 #[reflect(opaque)]
-#[reflect(Component, Default)]
+#[reflect(Component, Default, Clone)]
 pub struct CameraMainTextureUsages(pub TextureUsages);
 impl Default for CameraMainTextureUsages {
     fn default() -> Self {
@@ -1019,42 +1090,58 @@ pub fn extract_cameras(
     mut commands: Commands,
     query: Extract<
         Query<(
-            &RenderEntity,
+            Entity,
+            RenderEntity,
             &Camera,
             &CameraRenderGraph,
             &GlobalTransform,
             &VisibleEntities,
             &Frustum,
+            Has<Hdr>,
             Option<&ColorGrading>,
             Option<&Exposure>,
             Option<&TemporalJitter>,
             Option<&RenderLayers>,
             Option<&Projection>,
-            Has<GpuCulling>,
+            Has<NoIndirectDrawing>,
         )>,
     >,
     primary_window: Extract<Query<Entity, With<PrimaryWindow>>>,
     gpu_preprocessing_support: Res<GpuPreprocessingSupport>,
+    mapper: Extract<Query<&RenderEntity>>,
 ) {
     let primary_window = primary_window.iter().next();
     for (
+        main_entity,
         render_entity,
         camera,
         camera_render_graph,
         transform,
         visible_entities,
         frustum,
+        hdr,
         color_grading,
         exposure,
         temporal_jitter,
         render_layers,
         projection,
-        gpu_culling,
+        no_indirect_drawing,
     ) in query.iter()
     {
         if !camera.is_active {
+            commands.entity(render_entity).remove::<(
+                ExtractedCamera,
+                ExtractedView,
+                RenderVisibleEntities,
+                TemporalJitter,
+                RenderLayers,
+                Projection,
+                NoIndirectDrawing,
+                ViewUniformOffset,
+            )>();
             continue;
         }
+
         let color_grading = color_grading.unwrap_or(&ColorGrading::default()).clone();
 
         if let (
@@ -1073,7 +1160,28 @@ pub fn extract_cameras(
                 continue;
             }
 
-            let mut commands = commands.entity(render_entity.id());
+            let render_visible_entities = RenderVisibleEntities {
+                entities: visible_entities
+                    .entities
+                    .iter()
+                    .map(|(type_id, entities)| {
+                        let entities = entities
+                            .iter()
+                            .map(|entity| {
+                                let render_entity = mapper
+                                    .get(*entity)
+                                    .cloned()
+                                    .map(|entity| entity.id())
+                                    .unwrap_or(Entity::PLACEHOLDER);
+                                (render_entity, (*entity).into())
+                            })
+                            .collect();
+                        (*type_id, entities)
+                    })
+                    .collect(),
+            };
+
+            let mut commands = commands.entity(render_entity);
             commands.insert((
                 ExtractedCamera {
                     target: camera.target.normalize(primary_window),
@@ -1090,13 +1198,14 @@ pub fn extract_cameras(
                     exposure: exposure
                         .map(Exposure::exposure)
                         .unwrap_or_else(|| Exposure::default().exposure()),
-                    hdr: camera.hdr,
+                    hdr,
                 },
                 ExtractedView {
+                    retained_view_entity: RetainedViewEntity::new(main_entity.into(), None, 0),
                     clip_from_view: camera.clip_from_view(),
                     world_from_view: *transform,
                     clip_from_world: None,
-                    hdr: camera.hdr,
+                    hdr,
                     viewport: UVec4::new(
                         viewport_origin.x,
                         viewport_origin.y,
@@ -1105,7 +1214,7 @@ pub fn extract_cameras(
                     ),
                     color_grading,
                 },
-                visible_entities.clone(),
+                render_visible_entities,
                 *frustum,
             ));
 
@@ -1120,14 +1229,14 @@ pub fn extract_cameras(
             if let Some(perspective) = projection {
                 commands.insert(perspective.clone());
             }
-            if gpu_culling {
-                if *gpu_preprocessing_support == GpuPreprocessingSupport::Culling {
-                    commands.insert(GpuCulling);
-                } else {
-                    warn_once!(
-                        "GPU culling isn't supported on this platform; ignoring `GpuCulling`."
-                    );
-                }
+
+            if no_indirect_drawing
+                || !matches!(
+                    gpu_preprocessing_support.max_supported_mode,
+                    GpuPreprocessingMode::Culling
+                )
+            {
+                commands.insert(NoIndirectDrawing);
             }
         };
     }
@@ -1160,13 +1269,10 @@ pub fn sort_cameras(
     // sort by order and ensure within an order, RenderTargets of the same type are packed together
     sorted_cameras
         .0
-        .sort_by(|c1, c2| match c1.order.cmp(&c2.order) {
-            core::cmp::Ordering::Equal => c1.target.cmp(&c2.target),
-            ord => ord,
-        });
+        .sort_by(|c1, c2| (c1.order, &c1.target).cmp(&(c2.order, &c2.target)));
     let mut previous_order_target = None;
-    let mut ambiguities = HashSet::new();
-    let mut target_counts = HashMap::new();
+    let mut ambiguities = <HashSet<_>>::default();
+    let mut target_counts = <HashMap<_, _>>::default();
     for sorted_camera in &mut sorted_cameras.0 {
         let new_order_target = (sorted_camera.order, sorted_camera.target.clone());
         if let Some(previous_order_target) = previous_order_target {
@@ -1205,7 +1311,7 @@ pub fn sort_cameras(
 ///
 /// [`OrthographicProjection`]: crate::camera::OrthographicProjection
 #[derive(Component, Clone, Default, Reflect)]
-#[reflect(Default, Component)]
+#[reflect(Default, Component, Clone)]
 pub struct TemporalJitter {
     /// Offset is in range [-0.5, 0.5].
     pub offset: Vec2,

@@ -1,12 +1,26 @@
 //! This example demonstrates how fallible parameters can prevent their systems
 //! from running if their acquiry conditions aren't met.
 //!
-//! Fallible parameters include:
-//! - [`Res<R>`], [`ResMut<R>`] - Resource has to exist.
-//! - [`Single<D, F>`] - There must be exactly one matching entity.
-//! - [`Option<Single<D, F>>`] - There must be zero or one matching entity.
-//! - [`Populated<D, F>`] - There must be at least one matching entity.
+//! Fallible system parameters include:
+//! - [`Res<R>`], [`ResMut<R>`] - Resource has to exist, and the [`World::get_default_error_handler`] will be called if it doesn't.
+//! - [`Single<D, F>`] - There must be exactly one matching entity, but the system will be silently skipped otherwise.
+//! - [`Option<Single<D, F>>`] - There must be zero or one matching entity. The system will be silently skipped if there are more.
+//! - [`Populated<D, F>`] - There must be at least one matching entity, but the system will be silently skipped otherwise.
+//!
+//! Other system parameters, such as [`Query`], will never fail validation: returning a query with no matching entities is valid.
+//!
+//! The result of failed system parameter validation is determined by the [`SystemParamValidationError`] returned
+//! by [`SystemParam::validate_param`] for each system parameter.
+//! Each system will pass if all of its parameters are valid, or else return [`SystemParamValidationError`] for the first failing parameter.
+//!
+//! To learn more about setting the fallback behavior for [`SystemParamValidationError`] failures,
+//! please see the `error_handling.rs` example.
+//!
+//! [`SystemParamValidationError`]: bevy::ecs::system::SystemParamValidationError
+//! [`SystemParam::validate_param`]: bevy::ecs::system::SystemParam::validate_param
+//! [`default_error_handler`]: bevy::ecs::error::default_error_handler
 
+use bevy::ecs::error::warn;
 use bevy::prelude::*;
 use rand::Rng;
 
@@ -18,23 +32,14 @@ fn main() {
     println!();
 
     App::new()
+        // By default, if a parameter fail to be fetched,
+        // `World::get_default_error_handler` will be used to handle the error,
+        // which by default is set to panic.
+        .set_error_handler(warn)
         .add_plugins(DefaultPlugins)
         .add_systems(Startup, setup)
-        // Systems that fail parameter validation will emit warnings.
-        // The default policy is to emit a warning once per system.
-        // This is good for catching unexpected behavior, but can
-        // lead to spam. You can disable invalid param warnings
-        // per system using the `.never_param_warn()` method.
-        .add_systems(
-            Update,
-            (
-                user_input,
-                move_targets.never_param_warn(),
-                move_pointer.never_param_warn(),
-            )
-                .chain(),
-        )
-        // We will leave this systems with default warning policy.
+        .add_systems(Update, (user_input, move_targets, track_targets).chain())
+        // This system will always fail validation, because we never create an entity with both `Player` and `Enemy` components.
         .add_systems(Update, do_nothing_fail_validation)
         .run();
 }
@@ -68,15 +73,12 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
             rotation_speed: 2.0,
             min_follow_radius: 50.0,
         },
-        SpriteBundle {
-            sprite: Sprite {
-                color: bevy::color::palettes::tailwind::BLUE_800.into(),
-                ..default()
-            },
-            transform: Transform::from_translation(Vec3::ZERO),
-            texture,
-            ..default()
+        Sprite {
+            image: texture,
+            color: bevy::color::palettes::tailwind::BLUE_800.into(),
+            ..Default::default()
         },
+        Transform::from_translation(Vec3::ZERO),
     ));
 }
 
@@ -99,15 +101,12 @@ fn user_input(
                 rotation: rng.gen_range(0.0..std::f32::consts::TAU),
                 rotation_speed: rng.gen_range(0.5..1.5),
             },
-            SpriteBundle {
-                sprite: Sprite {
-                    color: bevy::color::palettes::tailwind::RED_800.into(),
-                    ..default()
-                },
-                transform: Transform::from_translation(Vec3::ZERO),
-                texture,
+            Sprite {
+                image: texture,
+                color: bevy::color::palettes::tailwind::RED_800.into(),
                 ..default()
             },
+            Transform::from_translation(Vec3::ZERO),
         ));
     }
 
@@ -119,24 +118,23 @@ fn user_input(
 }
 
 // System that moves the enemies in a circle.
-// Only runs if there are enemies.
+// Only runs if there are enemies, due to the `Populated` parameter.
 fn move_targets(mut enemies: Populated<(&mut Transform, &mut Enemy)>, time: Res<Time>) {
     for (mut transform, mut target) in &mut *enemies {
-        target.rotation += target.rotation_speed * time.delta_seconds();
+        target.rotation += target.rotation_speed * time.delta_secs();
         transform.rotation = Quat::from_rotation_z(target.rotation);
         let offset = transform.right() * target.radius;
         transform.translation = target.origin.extend(0.0) + offset;
     }
 }
 
-/// System that moves the player.
-/// The player will search for enemies if there are none.
-/// If there is one, player will track it.
-/// If there are too many enemies, the player will cease all action (the system will not run).
-fn move_pointer(
+/// System that moves the player, causing them to track a single enemy.
+/// If there is exactly one, player will track it.
+/// Otherwise, the player will search for enemies.
+fn track_targets(
     // `Single` ensures the system runs ONLY when exactly one matching entity exists.
     mut player: Single<(&mut Transform, &Player)>,
-    // `Option<Single>` ensures that the system runs ONLY when zero or one matching entity exists.
+    // `Option<Single>` never prevents the system from running, but will be `None` if there is not exactly one matching entity.
     enemy: Option<Single<&Transform, (With<Enemy>, Without<Player>)>>,
     time: Res<Time>,
 ) {
@@ -151,12 +149,12 @@ fn move_pointer(
         player_transform.rotation = Quat::from_mat3(&Mat3::from_cols(side, front, up));
         let max_step = distance - player.min_follow_radius;
         if 0.0 < max_step {
-            let velocity = (player.speed * time.delta_seconds()).min(max_step);
+            let velocity = (player.speed * time.delta_secs()).min(max_step);
             player_transform.translation += front * velocity;
         }
     } else {
-        // No enemy found, keep searching.
-        player_transform.rotate_axis(Dir3::Z, player.rotation_speed * time.delta_seconds());
+        // 0 or multiple enemies found, keep searching.
+        player_transform.rotate_axis(Dir3::Z, player.rotation_speed * time.delta_secs());
     }
 }
 

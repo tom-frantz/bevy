@@ -1,17 +1,13 @@
-use bevy_asset::{Asset, AssetEvent, AssetId, Assets};
-use bevy_ecs::{
-    event::EventReader,
-    system::{ResMut, Resource},
-};
+use bevy_asset::{AssetEvent, AssetId, Assets};
+use bevy_ecs::{event::EventReader, resource::Resource, system::ResMut};
+use bevy_image::prelude::*;
 use bevy_math::{IVec2, UVec2};
+use bevy_platform::collections::HashMap;
 use bevy_reflect::TypePath;
 use bevy_render::{
     render_asset::RenderAssetUsages,
     render_resource::{Extent3d, TextureDimension, TextureFormat},
-    texture::Image,
 };
-use bevy_sprite::TextureAtlasLayout;
-use bevy_utils::HashMap;
 
 use crate::{error::TextError, Font, FontAtlas, FontSmoothing, GlyphAtlasInfo};
 
@@ -57,19 +53,11 @@ pub struct FontAtlasKey(pub u32, pub FontSmoothing);
 ///
 /// Provides the interface for adding and retrieving rasterized glyphs, and manages the [`FontAtlas`]es.
 ///
-/// A `FontAtlasSet` is an [`Asset`].
-///
-/// There is one `FontAtlasSet` for each font:
-/// - When a [`Font`] is loaded as an asset and then used in [`Text`](crate::Text),
-///   a `FontAtlasSet` asset is created from a weak handle to the `Font`.
-/// - ~When a font is loaded as a system font, and then used in [`Text`](crate::Text),
-///   a `FontAtlasSet` asset is created and stored with a strong handle to the `FontAtlasSet`.~
-///   (*Note that system fonts are not currently supported by the `TextPipeline`.*)
+/// There is at most one `FontAtlasSet` for each font, stored in the `FontAtlasSets` resource.
+/// `FontAtlasSet`s are added and updated by the [`queue_text`](crate::pipeline::TextPipeline::queue_text) function.
 ///
 /// A `FontAtlasSet` contains one or more [`FontAtlas`]es for each font size.
-///
-/// It is used by [`TextPipeline::queue_text`](crate::TextPipeline::queue_text).
-#[derive(Debug, TypePath, Asset)]
+#[derive(Debug, TypePath)]
 pub struct FontAtlasSet {
     font_atlases: HashMap<FontAtlasKey, Vec<FontAtlas>>,
 }
@@ -92,9 +80,7 @@ impl FontAtlasSet {
     pub fn has_glyph(&self, cache_key: cosmic_text::CacheKey, font_size: &FontAtlasKey) -> bool {
         self.font_atlases
             .get(font_size)
-            .map_or(false, |font_atlas| {
-                font_atlas.iter().any(|atlas| atlas.has_glyph(cache_key))
-            })
+            .is_some_and(|font_atlas| font_atlas.iter().any(|atlas| atlas.has_glyph(cache_key)))
     }
 
     /// Adds the given subpixel-offset glyph to the [`FontAtlas`]es in this set
@@ -181,30 +167,24 @@ impl FontAtlasSet {
         self.font_atlases
             .get(&FontAtlasKey(cache_key.font_size_bits, font_smoothing))
             .and_then(|font_atlases| {
-                font_atlases
-                    .iter()
-                    .find_map(|atlas| {
-                        atlas.get_glyph_index(cache_key).map(|location| {
-                            (
-                                location,
-                                atlas.texture_atlas.clone_weak(),
-                                atlas.texture.clone_weak(),
-                            )
+                font_atlases.iter().find_map(|atlas| {
+                    atlas
+                        .get_glyph_index(cache_key)
+                        .map(|location| GlyphAtlasInfo {
+                            location,
+                            texture_atlas: atlas.texture_atlas.clone_weak(),
+                            texture: atlas.texture.clone_weak(),
                         })
-                    })
-                    .map(|(location, texture_atlas, texture)| GlyphAtlasInfo {
-                        texture_atlas,
-                        location,
-                        texture,
-                    })
+                })
             })
     }
 
-    /// Returns the number of font atlases in this set
+    /// Returns the number of font atlases in this set.
     pub fn len(&self) -> usize {
         self.font_atlases.len()
     }
-    /// Returns the number of font atlases in this set
+
+    /// Returns `true` if the set has no font atlases.
     pub fn is_empty(&self) -> bool {
         self.font_atlases.len() == 0
     }

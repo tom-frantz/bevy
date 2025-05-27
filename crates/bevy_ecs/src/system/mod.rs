@@ -79,6 +79,12 @@
 //! }
 //! ```
 //!
+//! # System return type
+//!
+//! Systems added to a schedule through [`add_systems`](crate::schedule::Schedule) may either return
+//! empty `()` or a [`Result`](crate::error::Result). Other contexts (like one shot systems) allow
+//! systems to return arbitrary values.
+//!
 //! # System parameter list
 //! Following is the complete list of accepted types as system parameters:
 //!
@@ -110,6 +116,8 @@
 //! - [`DynSystemParam`]
 //! - [`Vec<P>`] where `P: SystemParam`
 //! - [`ParamSet<Vec<P>>`] where `P: SystemParam`
+//!
+//! [`Vec<P>`]: alloc::vec::Vec
 
 mod adapter_system;
 mod builder;
@@ -121,7 +129,7 @@ mod function_system;
 mod input;
 mod observer_system;
 mod query;
-#[allow(clippy::module_inception)]
+mod schedule_system;
 mod system;
 mod system_name;
 mod system_param;
@@ -139,17 +147,24 @@ pub use function_system::*;
 pub use input::*;
 pub use observer_system::*;
 pub use query::*;
+pub use schedule_system::*;
 pub use system::*;
 pub use system_name::*;
 pub use system_param::*;
 pub use system_registry::*;
 
-use crate::world::World;
+use crate::world::{FromWorld, World};
 
 /// Conversion trait to turn something into a [`System`].
 ///
 /// Use this to get a system from a function. Also note that every system implements this trait as
 /// well.
+///
+/// # Usage notes
+///
+/// This trait should only be used as a bound for trait implementations or as an
+/// argument to a function. If a system needs to be returned from a function or
+/// stored somewhere, use [`System`] instead of this trait.
 ///
 /// # Examples
 ///
@@ -211,6 +226,77 @@ pub trait IntoSystem<In: SystemInput, Out, Marker>: Sized {
         F: Send + Sync + 'static + FnMut(Out) -> T,
     {
         IntoAdapterSystem::new(f, self)
+    }
+
+    /// Passes a mutable reference to `value` as input to the system each run,
+    /// turning it into a system that takes no input.
+    ///
+    /// `Self` can have any [`SystemInput`] type that takes a mutable reference
+    /// to `T`, such as [`InMut`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use bevy_ecs::prelude::*;
+    /// #
+    /// fn my_system(InMut(value): InMut<usize>) {
+    ///     *value += 1;
+    ///     if *value > 10 {
+    ///        println!("Value is greater than 10!");
+    ///     }
+    /// }
+    ///
+    /// # let mut schedule = Schedule::default();
+    /// schedule.add_systems(my_system.with_input(0));
+    /// # bevy_ecs::system::assert_is_system(my_system.with_input(0));
+    /// ```
+    fn with_input<T>(self, value: T) -> WithInputWrapper<Self::System, T>
+    where
+        for<'i> In: SystemInput<Inner<'i> = &'i mut T>,
+        T: Send + Sync + 'static,
+    {
+        WithInputWrapper::new(self, value)
+    }
+
+    /// Passes a mutable reference to a value of type `T` created via
+    /// [`FromWorld`] as input to the system each run, turning it into a system
+    /// that takes no input.
+    ///
+    /// `Self` can have any [`SystemInput`] type that takes a mutable reference
+    /// to `T`, such as [`InMut`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use bevy_ecs::prelude::*;
+    /// #
+    /// struct MyData {
+    ///     value: usize,
+    /// }
+    ///
+    /// impl FromWorld for MyData {
+    ///     fn from_world(world: &mut World) -> Self {
+    ///         // Fetch from the world the data needed to create `MyData`
+    /// #       MyData { value: 0 }
+    ///     }
+    /// }
+    ///
+    /// fn my_system(InMut(data): InMut<MyData>) {
+    ///     data.value += 1;
+    ///     if data.value > 10 {
+    ///         println!("Value is greater than 10!");
+    ///     }
+    /// }
+    /// # let mut schedule = Schedule::default();
+    /// schedule.add_systems(my_system.with_input_from::<MyData>());
+    /// # bevy_ecs::system::assert_is_system(my_system.with_input_from::<MyData>());
+    /// ```
+    fn with_input_from<T>(self) -> WithInputFromWrapper<Self::System, T>
+    where
+        for<'i> In: SystemInput<Inner<'i> = &'i mut T>,
+        T: FromWorld + Send + Sync + 'static,
+    {
+        WithInputFromWrapper::new(self)
     }
 
     /// Get the [`TypeId`] of the [`System`] produced after calling [`into_system`](`IntoSystem::into_system`).
@@ -308,30 +394,37 @@ pub fn assert_system_does_not_conflict<Out, Params, S: IntoSystem<(), Out, Param
 }
 
 #[cfg(test)]
+#[expect(clippy::print_stdout, reason = "Allowed in tests.")]
 mod tests {
+    use alloc::{vec, vec::Vec};
     use bevy_utils::default;
     use core::any::TypeId;
+    use std::println;
 
     use crate::{
-        self as bevy_ecs,
         archetype::{ArchetypeComponentId, Archetypes},
         bundle::Bundles,
         change_detection::DetectChanges,
-        component::{Component, Components, Tick},
+        component::{Component, Components},
         entity::{Entities, Entity},
-        prelude::{AnyOf, EntityRef},
-        query::{Added, Changed, Or, With, Without},
+        error::Result,
+        name::Name,
+        prelude::{AnyOf, EntityRef, Trigger},
+        query::{Added, Changed, Or, SpawnDetails, Spawned, With, Without},
         removal_detection::RemovedComponents,
+        resource::Resource,
         schedule::{
-            apply_deferred, common_conditions::resource_exists, Condition, IntoSystemConfigs,
-            Schedule,
+            common_conditions::resource_exists, ApplyDeferred, IntoScheduleConfigs, Schedule,
+            SystemCondition,
         },
         system::{
-            Commands, In, IntoSystem, Local, NonSend, NonSendMut, ParamSet, Query, Res, ResMut,
-            Resource, StaticSystemParam, System, SystemState,
+            Commands, In, InMut, IntoSystem, Local, NonSend, NonSendMut, ParamSet, Query, Res,
+            ResMut, Single, StaticSystemParam, System, SystemState,
         },
-        world::{EntityMut, FromWorld, World},
+        world::{DeferredWorld, EntityMut, FromWorld, OnAdd, World},
     };
+
+    use super::ScheduleSystem;
 
     #[derive(Resource, PartialEq, Debug)]
     enum SystemRan {
@@ -371,7 +464,10 @@ mod tests {
         system.run((), &mut world);
     }
 
-    fn run_system<Marker, S: IntoSystem<(), (), Marker>>(world: &mut World, system: S) {
+    fn run_system<Marker, S: IntoScheduleConfigs<ScheduleSystem, Marker>>(
+        world: &mut World,
+        system: S,
+    ) {
         let mut schedule = Schedule::default();
         schedule.add_systems(system);
         schedule.run(world);
@@ -379,7 +475,7 @@ mod tests {
 
     #[test]
     fn get_many_is_ordered() {
-        use crate::system::Resource;
+        use crate::resource::Resource;
         const ENTITIES_COUNT: usize = 1000;
 
         #[derive(Resource)]
@@ -408,8 +504,7 @@ mod tests {
             let entities_array: [Entity; ENTITIES_COUNT] =
                 entities_array.0.clone().try_into().unwrap();
 
-            #[allow(unused_mut)]
-            for (i, mut w) in (0..ENTITIES_COUNT).zip(q.get_many_mut(entities_array).unwrap()) {
+            for (i, w) in (0..ENTITIES_COUNT).zip(q.get_many_mut(entities_array).unwrap()) {
                 assert_eq!(i, w.0);
             }
 
@@ -461,7 +556,7 @@ mod tests {
 
     #[test]
     fn changed_resource_system() {
-        use crate::system::Resource;
+        use crate::resource::Resource;
 
         #[derive(Resource)]
         struct Flipper(bool);
@@ -493,7 +588,7 @@ mod tests {
 
         let mut schedule = Schedule::default();
 
-        schedule.add_systems((incr_e_on_flip, apply_deferred, World::clear_trackers).chain());
+        schedule.add_systems((incr_e_on_flip, ApplyDeferred, World::clear_trackers).chain());
 
         schedule.run(&mut world);
         assert_eq!(world.resource::<Added>().0, 1);
@@ -885,13 +980,18 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        dead_code,
+        reason = "The `NotSend1` and `NotSend2` structs is used to verify that a system will run, even if the system params include a non-Send resource. As such, the inner value doesn't matter."
+    )]
     fn non_send_option_system() {
         let mut world = World::default();
 
         world.insert_resource(SystemRan::No);
-        #[allow(dead_code)]
+        // Two structs are used, one which is inserted and one which is not, to verify that wrapping
+        // non-Send resources in an `Option` will allow the system to run regardless of their
+        // existence.
         struct NotSend1(alloc::rc::Rc<i32>);
-        #[allow(dead_code)]
         struct NotSend2(alloc::rc::Rc<i32>);
         world.insert_non_send_resource(NotSend1(alloc::rc::Rc::new(0)));
 
@@ -910,13 +1010,15 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        dead_code,
+        reason = "The `NotSend1` and `NotSend2` structs are used to verify that a system will run, even if the system params include a non-Send resource. As such, the inner value doesn't matter."
+    )]
     fn non_send_system() {
         let mut world = World::default();
 
         world.insert_resource(SystemRan::No);
-        #[allow(dead_code)]
         struct NotSend1(alloc::rc::Rc<i32>);
-        #[allow(dead_code)]
         struct NotSend2(alloc::rc::Rc<i32>);
 
         world.insert_non_send_resource(NotSend1(alloc::rc::Rc::new(1)));
@@ -1098,7 +1200,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_arguments)]
     fn can_have_16_parameters() {
         fn sys_x(
             _: Res<A>,
@@ -1157,12 +1258,15 @@ mod tests {
         world.insert_resource(A(42));
         world.spawn(B(7));
 
-        let mut system_state: SystemState<(Res<A>, Query<&B>, ParamSet<(Query<&C>, Query<&D>)>)> =
-            SystemState::new(&mut world);
+        let mut system_state: SystemState<(
+            Res<A>,
+            Option<Single<&B>>,
+            ParamSet<(Query<&C>, Query<&D>)>,
+        )> = SystemState::new(&mut world);
         let (a, query, _) = system_state.get(&world);
         assert_eq!(*a, A(42), "returned resource matches initial value");
         assert_eq!(
-            *query.single(),
+            **query.unwrap(),
             B(7),
             "returned component matches initial value"
         );
@@ -1180,16 +1284,16 @@ mod tests {
         world.insert_resource(A(42));
         world.spawn(B(7));
 
-        let mut system_state: SystemState<(ResMut<A>, Query<&mut B>)> =
+        let mut system_state: SystemState<(ResMut<A>, Option<Single<&mut B>>)> =
             SystemState::new(&mut world);
 
         // The following line shouldn't compile because the parameters used are not ReadOnlySystemParam
         // let (a, query) = system_state.get(&world);
 
-        let (a, mut query) = system_state.get_mut(&mut world);
+        let (a, query) = system_state.get_mut(&mut world);
         assert_eq!(*a, A(42), "returned resource matches initial value");
         assert_eq!(
-            *query.single_mut(),
+            **query.unwrap(),
             B(7),
             "returned component matches initial value"
         );
@@ -1203,21 +1307,41 @@ mod tests {
         let mut world = World::default();
         let entity = world.spawn(A(1)).id();
 
-        let mut system_state: SystemState<Query<&A, Changed<A>>> = SystemState::new(&mut world);
+        let mut system_state: SystemState<Option<Single<&A, Changed<A>>>> =
+            SystemState::new(&mut world);
         {
             let query = system_state.get(&world);
-            assert_eq!(*query.single(), A(1));
+            assert_eq!(**query.unwrap(), A(1));
         }
 
         {
             let query = system_state.get(&world);
-            assert!(query.get_single().is_err());
+            assert!(query.is_none());
         }
 
         world.entity_mut(entity).get_mut::<A>().unwrap().0 = 2;
         {
             let query = system_state.get(&world);
-            assert_eq!(*query.single(), A(2));
+            assert_eq!(**query.unwrap(), A(2));
+        }
+    }
+
+    #[test]
+    fn system_state_spawned() {
+        let mut world = World::default();
+        world.spawn_empty();
+        let spawn_tick = world.change_tick();
+
+        let mut system_state: SystemState<Option<Single<SpawnDetails, Spawned>>> =
+            SystemState::new(&mut world);
+        {
+            let query = system_state.get(&world);
+            assert_eq!(query.unwrap().spawned_at(), spawn_tick);
+        }
+
+        {
+            let query = system_state.get(&world);
+            assert!(query.is_none());
         }
     }
 
@@ -1262,9 +1386,11 @@ mod tests {
         }
     }
 
-    /// this test exists to show that read-only world-only queries can return data that lives as long as 'world
     #[test]
-    #[allow(unused)]
+    #[expect(
+        dead_code,
+        reason = "This test exists to show that read-only world-only queries can return data that lives as long as `'world`."
+    )]
     fn long_life_test() {
         struct Holder<'w> {
             value: &'w A,
@@ -1331,7 +1457,7 @@ mod tests {
             fn mutable_query(mut query: Query<&mut A>) {
                 for _ in &mut query {}
 
-                immutable_query(query.to_readonly());
+                immutable_query(query.as_readonly());
             }
 
             fn immutable_query(_: Query<&A>) {}
@@ -1346,7 +1472,7 @@ mod tests {
             fn mutable_query(mut query: Query<Option<&mut A>>) {
                 for _ in &mut query {}
 
-                immutable_query(query.to_readonly());
+                immutable_query(query.as_readonly());
             }
 
             fn immutable_query(_: Query<Option<&A>>) {}
@@ -1361,7 +1487,7 @@ mod tests {
             fn mutable_query(mut query: Query<(&mut A, &B)>) {
                 for _ in &mut query {}
 
-                immutable_query(query.to_readonly());
+                immutable_query(query.as_readonly());
             }
 
             fn immutable_query(_: Query<(&A, &B)>) {}
@@ -1376,7 +1502,7 @@ mod tests {
             fn mutable_query(mut query: Query<(&mut A, &mut B)>) {
                 for _ in &mut query {}
 
-                immutable_query(query.to_readonly());
+                immutable_query(query.as_readonly());
             }
 
             fn immutable_query(_: Query<(&A, &B)>) {}
@@ -1391,7 +1517,7 @@ mod tests {
             fn mutable_query(mut query: Query<(&mut A, &mut B), With<C>>) {
                 for _ in &mut query {}
 
-                immutable_query(query.to_readonly());
+                immutable_query(query.as_readonly());
             }
 
             fn immutable_query(_: Query<(&A, &B), With<C>>) {}
@@ -1406,7 +1532,7 @@ mod tests {
             fn mutable_query(mut query: Query<(&mut A, &mut B), Without<C>>) {
                 for _ in &mut query {}
 
-                immutable_query(query.to_readonly());
+                immutable_query(query.as_readonly());
             }
 
             fn immutable_query(_: Query<(&A, &B), Without<C>>) {}
@@ -1421,7 +1547,7 @@ mod tests {
             fn mutable_query(mut query: Query<(&mut A, &mut B), Added<C>>) {
                 for _ in &mut query {}
 
-                immutable_query(query.to_readonly());
+                immutable_query(query.as_readonly());
             }
 
             fn immutable_query(_: Query<(&A, &B), Added<C>>) {}
@@ -1436,10 +1562,25 @@ mod tests {
             fn mutable_query(mut query: Query<(&mut A, &mut B), Changed<C>>) {
                 for _ in &mut query {}
 
-                immutable_query(query.to_readonly());
+                immutable_query(query.as_readonly());
             }
 
             fn immutable_query(_: Query<(&A, &B), Changed<C>>) {}
+
+            let mut sys = IntoSystem::into_system(mutable_query);
+            sys.initialize(&mut world);
+        }
+
+        {
+            let mut world = World::new();
+
+            fn mutable_query(mut query: Query<(&mut A, &mut B, SpawnDetails), Spawned>) {
+                for _ in &mut query {}
+
+                immutable_query(query.as_readonly());
+            }
+
+            fn immutable_query(_: Query<(&A, &B, SpawnDetails), Spawned>) {}
 
             let mut sys = IntoSystem::into_system(mutable_query);
             sys.initialize(&mut world);
@@ -1543,24 +1684,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic = "Encountered a mismatched World."]
-    fn query_validates_world_id() {
-        let mut world1 = World::new();
-        let world2 = World::new();
-        let qstate = world1.query::<()>();
-        // SAFETY: doesnt access anything
-        let query = unsafe {
-            Query::new(
-                world2.as_unsafe_world_cell_readonly(),
-                &qstate,
-                Tick::new(0),
-                Tick::new(0),
-            )
-        };
-        query.iter();
-    }
-
-    #[test]
     #[should_panic]
     fn assert_system_does_not_conflict() {
         fn system(_query: Query<(&mut W<u32>, &mut W<u32>)>) {}
@@ -1569,16 +1692,25 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "error[B0001]: Query<bevy_ecs::world::entity_ref::EntityMut, ()> in system bevy_ecs::system::tests::assert_world_and_entity_mut_system_does_conflict::system accesses component(s) in a way that conflicts with a previous system parameter. Consider using `Without<T>` to create disjoint Queries or merging conflicting Queries into a `ParamSet`. See: https://bevyengine.org/learn/errors/b0001"
+        expected = "error[B0001]: Query<EntityMut, ()> in system bevy_ecs::system::tests::assert_world_and_entity_mut_system_does_conflict_first::system accesses component(s) in a way that conflicts with a previous system parameter. Consider using `Without<T>` to create disjoint Queries or merging conflicting Queries into a `ParamSet`. See: https://bevyengine.org/learn/errors/b0001"
     )]
-    fn assert_world_and_entity_mut_system_does_conflict() {
+    fn assert_world_and_entity_mut_system_does_conflict_first() {
         fn system(_query: &World, _q2: Query<EntityMut>) {}
         super::assert_system_does_not_conflict(system);
     }
 
     #[test]
     #[should_panic(
-        expected = "error[B0001]: Query<bevy_ecs::world::entity_ref::EntityMut, ()> in system bevy_ecs::system::tests::assert_entity_ref_and_entity_mut_system_does_conflict::system accesses component(s) in a way that conflicts with a previous system parameter. Consider using `Without<T>` to create disjoint Queries or merging conflicting Queries into a `ParamSet`. See: https://bevyengine.org/learn/errors/b0001"
+        expected = "&World conflicts with a previous mutable system parameter. Allowing this would break Rust's mutability rules"
+    )]
+    fn assert_world_and_entity_mut_system_does_conflict_second() {
+        fn system(_: Query<EntityMut>, _: &World) {}
+        super::assert_system_does_not_conflict(system);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "error[B0001]: Query<EntityMut, ()> in system bevy_ecs::system::tests::assert_entity_ref_and_entity_mut_system_does_conflict::system accesses component(s) in a way that conflicts with a previous system parameter. Consider using `Without<T>` to create disjoint Queries or merging conflicting Queries into a `ParamSet`. See: https://bevyengine.org/learn/errors/b0001"
     )]
     fn assert_entity_ref_and_entity_mut_system_does_conflict() {
         fn system(_query: Query<EntityRef>, _q2: Query<EntityMut>) {}
@@ -1587,7 +1719,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "error[B0001]: Query<bevy_ecs::world::entity_ref::EntityMut, ()> in system bevy_ecs::system::tests::assert_entity_mut_system_does_conflict::system accesses component(s) in a way that conflicts with a previous system parameter. Consider using `Without<T>` to create disjoint Queries or merging conflicting Queries into a `ParamSet`. See: https://bevyengine.org/learn/errors/b0001"
+        expected = "error[B0001]: Query<EntityMut, ()> in system bevy_ecs::system::tests::assert_entity_mut_system_does_conflict::system accesses component(s) in a way that conflicts with a previous system parameter. Consider using `Without<T>` to create disjoint Queries or merging conflicting Queries into a `ParamSet`. See: https://bevyengine.org/learn/errors/b0001"
     )]
     fn assert_entity_mut_system_does_conflict() {
         fn system(_query: Query<EntityMut>, _q2: Query<EntityMut>) {}
@@ -1595,10 +1727,43 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(
+        expected = "error[B0001]: Query<EntityRef, ()> in system bevy_ecs::system::tests::assert_deferred_world_and_entity_ref_system_does_conflict_first::system accesses component(s) in a way that conflicts with a previous system parameter. Consider using `Without<T>` to create disjoint Queries or merging conflicting Queries into a `ParamSet`. See: https://bevyengine.org/learn/errors/b0001"
+    )]
+    fn assert_deferred_world_and_entity_ref_system_does_conflict_first() {
+        fn system(_world: DeferredWorld, _query: Query<EntityRef>) {}
+        super::assert_system_does_not_conflict(system);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "DeferredWorld in system bevy_ecs::system::tests::assert_deferred_world_and_entity_ref_system_does_conflict_second::system conflicts with a previous access."
+    )]
+    fn assert_deferred_world_and_entity_ref_system_does_conflict_second() {
+        fn system(_query: Query<EntityRef>, _world: DeferredWorld) {}
+        super::assert_system_does_not_conflict(system);
+    }
+
+    #[test]
+    fn assert_deferred_world_and_empty_query_does_not_conflict_first() {
+        fn system(_world: DeferredWorld, _query: Query<Entity>) {}
+        super::assert_system_does_not_conflict(system);
+    }
+
+    #[test]
+    fn assert_deferred_world_and_empty_query_does_not_conflict_second() {
+        fn system(_query: Query<Entity>, _world: DeferredWorld) {}
+        super::assert_system_does_not_conflict(system);
+    }
+
+    #[test]
     #[should_panic]
     fn panic_inside_system() {
         let mut world = World::new();
-        run_system(&mut world, || panic!("this system panics"));
+        let system: fn() = || {
+            panic!("this system panics");
+        };
+        run_system(&mut world, system);
     }
 
     #[test]
@@ -1638,7 +1803,14 @@ mod tests {
         assert_is_system(returning::<Option<()>>.map(drop));
         assert_is_system(returning::<&str>.map(u64::from_str).map(Result::unwrap));
         assert_is_system(static_system_param);
-        assert_is_system(exclusive_in_out::<(), Result<(), std::io::Error>>.map(bevy_utils::error));
+        assert_is_system(
+            exclusive_in_out::<(), Result<(), std::io::Error>>.map(|_out| {
+                #[cfg(feature = "trace")]
+                if let Err(error) = _out {
+                    tracing::error!("{}", error);
+                }
+            }),
+        );
         assert_is_system(exclusive_with_state);
         assert_is_system(returning::<bool>.pipe(exclusive_in_out::<bool, ()>));
 
@@ -1744,5 +1916,108 @@ mod tests {
         sched.initialize(&mut world).unwrap();
         sched.run(&mut world);
         assert_eq!(world.get_resource(), Some(&C(3)));
+    }
+
+    #[test]
+    #[should_panic]
+    fn simple_fallible_system() {
+        fn sys() -> Result {
+            Err("error")?;
+            Ok(())
+        }
+
+        let mut world = World::new();
+        run_system(&mut world, sys);
+    }
+
+    // Regression test for
+    // https://github.com/bevyengine/bevy/issues/18778
+    //
+    // Dear rustc team, please reach out if you encounter this
+    // in a crater run and we can work something out!
+    //
+    // These todo! macro calls should never be removed;
+    // they're intended to demonstrate real-world usage
+    // in a way that's clearer than simply calling `panic!`
+    //
+    // Because type inference behaves differently for functions and closures,
+    // we need to test both, in addition to explicitly annotating the return type
+    // to ensure that there are no upstream regressions there.
+    #[test]
+    fn nondiverging_never_trait_impls() {
+        // This test is a compilation test:
+        // no meaningful logic is ever actually evaluated.
+        // It is simply intended to check that the correct traits are implemented
+        // when todo! or similar nondiverging panics are used.
+        let mut world = World::new();
+        let mut schedule = Schedule::default();
+
+        fn sys(_query: Query<&Name>) {
+            todo!()
+        }
+
+        schedule.add_systems(sys);
+        schedule.add_systems(|_query: Query<&Name>| {});
+        schedule.add_systems(|_query: Query<&Name>| todo!());
+        #[expect(clippy::unused_unit, reason = "this forces the () return type")]
+        schedule.add_systems(|_query: Query<&Name>| -> () { todo!() });
+
+        fn obs(_trigger: Trigger<OnAdd, Name>) {
+            todo!()
+        }
+
+        world.add_observer(obs);
+        world.add_observer(|_trigger: Trigger<OnAdd, Name>| {});
+        world.add_observer(|_trigger: Trigger<OnAdd, Name>| todo!());
+        #[expect(clippy::unused_unit, reason = "this forces the () return type")]
+        world.add_observer(|_trigger: Trigger<OnAdd, Name>| -> () { todo!() });
+
+        fn my_command(_world: &mut World) {
+            todo!()
+        }
+
+        world.commands().queue(my_command);
+        world.commands().queue(|_world: &mut World| {});
+        world.commands().queue(|_world: &mut World| todo!());
+        #[expect(clippy::unused_unit, reason = "this forces the () return type")]
+        world
+            .commands()
+            .queue(|_world: &mut World| -> () { todo!() });
+    }
+
+    #[test]
+    fn with_input() {
+        fn sys(InMut(v): InMut<usize>) {
+            *v += 1;
+        }
+
+        let mut world = World::new();
+        let mut system = IntoSystem::into_system(sys.with_input(42));
+        system.initialize(&mut world);
+        system.run((), &mut world);
+        assert_eq!(*system.value(), 43);
+    }
+
+    #[test]
+    fn with_input_from() {
+        struct TestData(usize);
+
+        impl FromWorld for TestData {
+            fn from_world(_world: &mut World) -> Self {
+                Self(5)
+            }
+        }
+
+        fn sys(InMut(v): InMut<TestData>) {
+            v.0 += 1;
+        }
+
+        let mut world = World::new();
+        let mut system = IntoSystem::into_system(sys.with_input_from::<TestData>());
+        assert!(system.value().is_none());
+        system.initialize(&mut world);
+        assert!(system.value().is_some());
+        system.run((), &mut world);
+        assert_eq!(system.value().unwrap().0, 6);
     }
 }

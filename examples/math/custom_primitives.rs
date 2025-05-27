@@ -36,6 +36,7 @@ const TRANSFORM_2D: Transform = Transform {
 const PROJECTION_2D: Projection = Projection::Orthographic(OrthographicProjection {
     near: -1.0,
     far: 10.0,
+    scale: 1.0,
     viewport_origin: Vec2::new(0.5, 0.5),
     scaling_mode: ScalingMode::AutoMax {
         max_width: 8.0,
@@ -120,7 +121,7 @@ fn setup(
 
     // Spawn the 2D heart
     commands.spawn((
-        // We can use the methods defined on the meshbuilder to customize the mesh.
+        // We can use the methods defined on the `MeshBuilder` to customize the mesh.
         Mesh3d(meshes.add(HEART.mesh().resolution(50))),
         MeshMaterial3d(materials.add(StandardMaterial {
             emissive: RED.into(),
@@ -133,7 +134,7 @@ fn setup(
 
     // Spawn an extrusion of the heart.
     commands.spawn((
-        // We can set a custom resolution for the round parts of the extrusion aswell.
+        // We can set a custom resolution for the round parts of the extrusion as well.
         Mesh3d(meshes.add(EXTRUSION.mesh().resolution(50))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: RED.into(),
@@ -156,24 +157,21 @@ fn setup(
     ));
 
     // Example instructions
-    commands.spawn(
-        TextBundle::from_section(
-            "Press 'B' to toggle between no bounding shapes, bounding boxes (AABBs) and bounding spheres / circles\n\
-            Press 'Space' to switch between 3D and 2D",
-            TextStyle::default(),
-        )
-        .with_style(Style {
+    commands.spawn((
+        Text::new("Press 'B' to toggle between no bounding shapes, bounding boxes (AABBs) and bounding spheres / circles\n\
+            Press 'Space' to switch between 3D and 2D"),
+        Node {
             position_type: PositionType::Absolute,
             top: Val::Px(12.0),
             left: Val::Px(12.0),
             ..default()
-        }),
-    );
+        },
+    ));
 }
 
 // Rotate the 2D shapes.
 fn rotate_2d_shapes(mut shapes: Query<&mut Transform, With<Shape2d>>, time: Res<Time>) {
-    let elapsed_seconds = time.elapsed_seconds();
+    let elapsed_seconds = time.elapsed_secs();
 
     for mut transform in shapes.iter_mut() {
         transform.rotation = Quat::from_rotation_z(elapsed_seconds);
@@ -197,23 +195,13 @@ fn bounding_shapes_2d(
             BoundingShape::BoundingBox => {
                 // Get the AABB of the primitive with the rotation and translation of the mesh.
                 let aabb = HEART.aabb_2d(isometry);
-
-                gizmos.rect_2d(
-                    Isometry2d::from_translation(aabb.center()),
-                    aabb.half_size() * 2.,
-                    WHITE,
-                );
+                gizmos.rect_2d(aabb.center(), aabb.half_size() * 2., WHITE);
             }
             BoundingShape::BoundingSphere => {
                 // Get the bounding sphere of the primitive with the rotation and translation of the mesh.
                 let bounding_circle = HEART.bounding_circle(isometry);
-
                 gizmos
-                    .circle_2d(
-                        Isometry2d::from_translation(bounding_circle.center()),
-                        bounding_circle.radius(),
-                        WHITE,
-                    )
+                    .circle_2d(bounding_circle.center(), bounding_circle.radius(), WHITE)
                     .resolution(64);
             }
         }
@@ -222,7 +210,7 @@ fn bounding_shapes_2d(
 
 // Rotate the 3D shapes.
 fn rotate_3d_shapes(mut shapes: Query<&mut Transform, With<Shape3d>>, time: Res<Time>) {
-    let delta_seconds = time.delta_seconds();
+    let delta_seconds = time.delta_secs();
 
     for mut transform in shapes.iter_mut() {
         transform.rotate_y(delta_seconds);
@@ -244,7 +232,7 @@ fn bounding_shapes_3d(
 
                 gizmos.primitive_3d(
                     &Cuboid::from_size(Vec3::from(aabb.half_size()) * 2.),
-                    Isometry3d::from_translation(aabb.center()),
+                    aabb.center(),
                     WHITE,
                 );
             }
@@ -252,11 +240,7 @@ fn bounding_shapes_3d(
                 // Get the bounding sphere of the extrusion with the rotation and translation of the mesh.
                 let bounding_sphere = EXTRUSION.bounding_sphere(transform.to_isometry());
 
-                gizmos.sphere(
-                    Isometry3d::from_translation(bounding_sphere.center()),
-                    bounding_sphere.radius(),
-                    WHITE,
-                );
+                gizmos.sphere(bounding_sphere.center(), bounding_sphere.radius(), WHITE);
             }
         }
     }
@@ -278,7 +262,7 @@ fn update_bounding_shape(
 fn switch_cameras(
     current: Res<State<CameraActive>>,
     mut next: ResMut<NextState<CameraActive>>,
-    mut camera: Query<(&mut Transform, &mut Projection)>,
+    camera: Single<(&mut Transform, &mut Projection)>,
 ) {
     let next_state = match current.get() {
         CameraActive::Dim2 => CameraActive::Dim3,
@@ -286,7 +270,7 @@ fn switch_cameras(
     };
     next.set(next_state);
 
-    let (mut transform, mut projection) = camera.single_mut();
+    let (mut transform, mut projection) = camera.into_inner();
     match next_state {
         CameraActive::Dim2 => {
             *transform = TRANSFORM_2D;
@@ -336,7 +320,9 @@ impl Measured2d for Heart {
 
 // The `Bounded2d` or `Bounded3d` traits are used to compute the Axis Aligned Bounding Boxes or bounding circles / spheres for primitives.
 impl Bounded2d for Heart {
-    fn aabb_2d(&self, isometry: Isometry2d) -> Aabb2d {
+    fn aabb_2d(&self, isometry: impl Into<Isometry2d>) -> Aabb2d {
+        let isometry = isometry.into();
+
         // The center of the circle at the center of the right wing of the heart
         let circle_center = isometry.rotation * Vec2::new(self.radius, 0.0);
         // The maximum X and Y positions of the two circles of the wings of the heart.
@@ -353,7 +339,9 @@ impl Bounded2d for Heart {
         }
     }
 
-    fn bounding_circle(&self, isometry: Isometry2d) -> BoundingCircle {
+    fn bounding_circle(&self, isometry: impl Into<Isometry2d>) -> BoundingCircle {
+        let isometry = isometry.into();
+
         // The bounding circle of the heart is not at its origin. This `offset` is the offset between the center of the bounding circle and its translation.
         let offset = self.radius / ops::powf(2f32, 1.5);
         // The center of the bounding circle
@@ -370,7 +358,7 @@ impl BoundedExtrusion for Heart {}
 
 // You can use the `Meshable` trait to create a `MeshBuilder` for the primitive.
 impl Meshable for Heart {
-    // The meshbuilder can be used to create the actual mesh for that primitive.
+    // The `MeshBuilder` can be used to create the actual mesh for that primitive.
     type Output = HeartMeshBuilder;
 
     fn mesh(&self) -> Self::Output {
@@ -381,7 +369,7 @@ impl Meshable for Heart {
     }
 }
 
-// You can include any additional information needed for meshing the primitive in the meshbuilder.
+// You can include any additional information needed for meshing the primitive in the `MeshBuilder`.
 struct HeartMeshBuilder {
     heart: Heart,
     // The resolution determines the amount of vertices used for each wing of the heart
@@ -389,7 +377,7 @@ struct HeartMeshBuilder {
 }
 
 // This trait is needed so that the configuration methods of the builder of the primitive are also available for the builder for the extrusion.
-// If you do not want to support these configuration options for extrusions you can just implement them for your 2D mesh builder.
+// If you do not want to support these configuration options for extrusions you can just implement them for your 2D `MeshBuilder`.
 trait HeartBuilder {
     /// Set the resolution for each of the wings of the heart.
     fn resolution(self, resolution: usize) -> Self;

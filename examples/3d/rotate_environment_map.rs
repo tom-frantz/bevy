@@ -5,8 +5,9 @@ use std::f32::consts::PI;
 use bevy::{
     color::palettes::css::{GOLD, WHITE},
     core_pipeline::{tonemapping::Tonemapping::AcesFitted, Skybox},
+    image::ImageLoaderSettings,
     prelude::*,
-    render::texture::ImageLoaderSettings,
+    render::view::Hdr,
 };
 
 /// Entry point.
@@ -36,7 +37,7 @@ fn rotate_skybox_and_environment_map(
     mut environments: Query<(&mut Skybox, &mut EnvironmentMapLight)>,
     time: Res<Time>,
 ) {
-    let now = time.elapsed_seconds();
+    let now = time.elapsed_secs();
     let rotation = Quat::from_rotation_y(0.2 * now);
     for (mut skybox, mut environment_map) in environments.iter_mut() {
         skybox.rotation = rotation;
@@ -95,10 +96,7 @@ fn spawn_camera(commands: &mut Commands, asset_server: &AssetServer) {
     commands
         .spawn((
             Camera3d::default(),
-            Camera {
-                hdr: true,
-                ..default()
-            },
+            Hdr,
             Projection::Perspective(PerspectiveProjection {
                 fov: 27.0 / 180.0 * PI,
                 ..default()

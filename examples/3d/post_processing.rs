@@ -6,6 +6,7 @@ use std::f32::consts::PI;
 
 use bevy::{
     core_pipeline::post_process::ChromaticAberration, pbr::CascadeShadowConfigBuilder, prelude::*,
+    render::view::Hdr,
 };
 
 /// The number of units per frame to add to or subtract from intensity when the
@@ -60,10 +61,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>, app_settings: R
 fn spawn_camera(commands: &mut Commands, asset_server: &AssetServer) {
     commands.spawn((
         Camera3d::default(),
-        Camera {
-            hdr: true,
-            ..default()
-        },
+        Hdr,
         Transform::from_xyz(0.7, 0.7, 1.0).looking_at(Vec3::new(0.0, 0.3, 0.0), Vec3::Y),
         DistanceFog {
             color: Color::srgb_u8(43, 44, 47),
@@ -122,18 +120,15 @@ fn spawn_scene(commands: &mut Commands, asset_server: &AssetServer) {
 
 /// Spawns the help text at the bottom of the screen.
 fn spawn_text(commands: &mut Commands, app_settings: &AppSettings) {
-    commands.spawn(
-        TextBundle {
-            text: create_help_text(app_settings),
-            ..default()
-        }
-        .with_style(Style {
+    commands.spawn((
+        create_help_text(app_settings),
+        Node {
             position_type: PositionType::Absolute,
             bottom: Val::Px(12.0),
             left: Val::Px(12.0),
             ..default()
-        }),
-    );
+        },
+    ));
 }
 
 impl Default for AppSettings {
@@ -146,13 +141,11 @@ impl Default for AppSettings {
 
 /// Creates help text at the bottom of the screen.
 fn create_help_text(app_settings: &AppSettings) -> Text {
-    Text::from_section(
-        format!(
-            "Chromatic aberration intensity: {} (Press Left or Right to change)",
-            app_settings.chromatic_aberration_intensity
-        ),
-        TextStyle::default(),
+    format!(
+        "Chromatic aberration intensity: {} (Press Left or Right to change)",
+        app_settings.chromatic_aberration_intensity
     )
+    .into()
 }
 
 /// Handles requests from the user to change the chromatic aberration intensity.

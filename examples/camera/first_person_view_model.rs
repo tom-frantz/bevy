@@ -15,9 +15,9 @@
 //! be able to change its FOV to accommodate the player's preferences for the following reasons:
 //! - *Accessibility*: How prone is the player to motion sickness? A wider FOV can help.
 //! - *Tactical preference*: Does the player want to see more of the battlefield?
-//!     Or have a more zoomed-in view for precision aiming?
+//!   Or have a more zoomed-in view for precision aiming?
 //! - *Physical considerations*: How well does the in-game FOV match the player's real-world FOV?
-//!     Are they sitting in front of a monitor or playing on a TV in the living room? How big is the screen?
+//!   Are they sitting in front of a monitor or playing on a TV in the living room? How big is the screen?
 //!
 //! ## Implementation
 //!
@@ -27,12 +27,12 @@
 //! We use different `RenderLayers` to select what to render.
 //!
 //! - The world model camera has no explicit `RenderLayers` component, so it uses the layer 0.
-//!     All static objects in the scene are also on layer 0 for the same reason.
+//!   All static objects in the scene are also on layer 0 for the same reason.
 //! - The view model camera has a `RenderLayers` component with layer 1, so it only renders objects
-//!     explicitly assigned to layer 1. The arm of the player is one such object.
-//!     The order of the view model camera is additionally bumped to 1 to ensure it renders on top of the world model.
+//!   explicitly assigned to layer 1. The arm of the player is one such object.
+//!   The order of the view model camera is additionally bumped to 1 to ensure it renders on top of the world model.
 //! - The light source in the scene must illuminate both the view model and the world model, so it is
-//!     assigned to both layers 0 and 1.
+//!   assigned to both layers 0 and 1.
 //!
 //! ## Controls
 //!
@@ -104,27 +104,22 @@ fn spawn_view_model(
     let arm = meshes.add(Cuboid::new(0.1, 0.1, 0.5));
     let arm_material = materials.add(Color::from(tailwind::TEAL_200));
 
-    commands
-        .spawn((
-            Player,
-            CameraSensitivity::default(),
-            SpatialBundle {
-                transform: Transform::from_xyz(0.0, 1.0, 0.0),
-                ..default()
-            },
-        ))
-        .with_children(|parent| {
-            parent.spawn((
+    commands.spawn((
+        Player,
+        CameraSensitivity::default(),
+        Transform::from_xyz(0.0, 1.0, 0.0),
+        Visibility::default(),
+        children![
+            (
                 WorldModelCamera,
                 Camera3d::default(),
                 Projection::from(PerspectiveProjection {
                     fov: 90.0_f32.to_radians(),
                     ..default()
                 }),
-            ));
-
+            ),
             // Spawn view model camera.
-            parent.spawn((
+            (
                 Camera3d::default(),
                 Camera {
                     // Bump the order to render on top of the world model.
@@ -137,10 +132,9 @@ fn spawn_view_model(
                 }),
                 // Only render objects belonging to the view model.
                 RenderLayers::layer(VIEW_MODEL_RENDER_LAYER),
-            ));
-
+            ),
             // Spawn the player's right arm.
-            parent.spawn((
+            (
                 Mesh3d(arm),
                 MeshMaterial3d(arm_material),
                 Transform::from_xyz(0.2, -0.1, -0.25),
@@ -148,8 +142,9 @@ fn spawn_view_model(
                 RenderLayers::layer(VIEW_MODEL_RENDER_LAYER),
                 // The arm is free-floating, so shadows would look weird.
                 NotShadowCaster,
-            ));
-        });
+            ),
+        ],
+    ));
 }
 
 fn spawn_world_model(
@@ -194,34 +189,25 @@ fn spawn_lights(mut commands: Commands) {
 
 fn spawn_text(mut commands: Commands) {
     commands
-        .spawn(NodeBundle {
-            style: Style {
-                position_type: PositionType::Absolute,
-                bottom: Val::Px(12.0),
-                left: Val::Px(12.0),
-                ..default()
-            },
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(12.0),
+            left: Val::Px(12.0),
             ..default()
         })
-        .with_children(|parent| {
-            parent.spawn(TextBundle::from_section(
-                concat!(
-                    "Move the camera with your mouse.\n",
-                    "Press arrow up to decrease the FOV of the world model.\n",
-                    "Press arrow down to increase the FOV of the world model."
-                ),
-                TextStyle::default(),
-            ));
-        });
+        .with_child(Text::new(concat!(
+            "Move the camera with your mouse.\n",
+            "Press arrow up to decrease the FOV of the world model.\n",
+            "Press arrow down to increase the FOV of the world model."
+        )));
 }
 
 fn move_player(
     accumulated_mouse_motion: Res<AccumulatedMouseMotion>,
-    mut player: Query<(&mut Transform, &CameraSensitivity), With<Player>>,
+    player: Single<(&mut Transform, &CameraSensitivity), With<Player>>,
 ) {
-    let Ok((mut transform, camera_sensitivity)) = player.get_single_mut() else {
-        return;
-    };
+    let (mut transform, camera_sensitivity) = player.into_inner();
+
     let delta = accumulated_mouse_motion.delta;
 
     if delta != Vec2::ZERO {
@@ -252,12 +238,9 @@ fn move_player(
 
 fn change_fov(
     input: Res<ButtonInput<KeyCode>>,
-    mut world_model_projection: Query<&mut Projection, With<WorldModelCamera>>,
+    mut world_model_projection: Single<&mut Projection, With<WorldModelCamera>>,
 ) {
-    let Ok(mut projection) = world_model_projection.get_single_mut() else {
-        return;
-    };
-    let Projection::Perspective(ref mut perspective) = projection.as_mut() else {
+    let Projection::Perspective(perspective) = world_model_projection.as_mut() else {
         unreachable!(
             "The `Projection` component was explicitly built with `Projection::Perspective`"
         );

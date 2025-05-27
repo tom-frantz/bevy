@@ -15,17 +15,19 @@
 //! [Depth of field]: https://en.wikipedia.org/wiki/Depth_of_field
 
 use bevy_app::{App, Plugin};
-use bevy_asset::{load_internal_asset, Handle};
+use bevy_asset::{load_internal_asset, weak_handle, Handle};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     component::Component,
     entity::Entity,
     query::{QueryItem, With},
     reflect::ReflectComponent,
-    schedule::IntoSystemConfigs as _,
-    system::{lifetimeless::Read, Commands, Query, Res, ResMut, Resource},
+    resource::Resource,
+    schedule::IntoScheduleConfigs as _,
+    system::{lifetimeless::Read, Commands, Query, Res, ResMut},
     world::{FromWorld, World},
 };
+use bevy_image::BevyDefault as _;
 use bevy_math::ops;
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_render::{
@@ -46,16 +48,18 @@ use bevy_render::{
         TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
     },
     renderer::{RenderContext, RenderDevice},
-    texture::{BevyDefault, CachedTexture, TextureCache},
+    sync_component::SyncComponentPlugin,
+    sync_world::RenderEntity,
+    texture::{CachedTexture, TextureCache},
     view::{
         prepare_view_targets, ExtractedView, Msaa, ViewDepthTexture, ViewTarget, ViewUniform,
         ViewUniformOffset, ViewUniforms,
     },
-    world_sync::RenderEntity,
-    Extract, ExtractSchedule, Render, RenderApp, RenderSet,
+    Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
 };
-use bevy_utils::{info_once, prelude::default, warn_once};
+use bevy_utils::{default, once};
 use smallvec::SmallVec;
+use tracing::{info, warn};
 
 use crate::{
     core_3d::{
@@ -65,7 +69,7 @@ use crate::{
     fullscreen_vertex_shader::fullscreen_shader_vertex_state,
 };
 
-const DOF_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(2031861180739216043);
+const DOF_SHADER_HANDLE: Handle<Shader> = weak_handle!("c3580ddc-2cbc-4535-a02b-9a2959066b52");
 
 /// A plugin that adds support for the depth of field effect to Bevy.
 pub struct DepthOfFieldPlugin;
@@ -75,7 +79,7 @@ pub struct DepthOfFieldPlugin;
 ///
 /// [depth of field]: https://en.wikipedia.org/wiki/Depth_of_field
 #[derive(Component, Clone, Copy, Reflect)]
-#[reflect(Component, Default)]
+#[reflect(Component, Clone, Default)]
 pub struct DepthOfField {
     /// The appearance of the effect.
     pub mode: DepthOfFieldMode,
@@ -117,12 +121,9 @@ pub struct DepthOfField {
     pub max_depth: f32,
 }
 
-#[deprecated(since = "0.15.0", note = "Renamed to `DepthOfField`")]
-pub type DepthOfFieldSettings = DepthOfField;
-
 /// Controls the appearance of the effect.
 #[derive(Clone, Copy, Default, PartialEq, Debug, Reflect)]
-#[reflect(Default, PartialEq)]
+#[reflect(Default, Clone, PartialEq)]
 pub enum DepthOfFieldMode {
     /// A more accurate simulation, in which circles of confusion generate
     /// "spots" of light.
@@ -211,6 +212,8 @@ impl Plugin for DepthOfFieldPlugin {
         app.register_type::<DepthOfFieldMode>();
         app.add_plugins(UniformComponentPlugin::<DepthOfFieldUniform>::default());
 
+        app.add_plugins(SyncComponentPlugin::<DepthOfField>::default());
+
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
@@ -226,7 +229,7 @@ impl Plugin for DepthOfFieldPlugin {
                     prepare_auxiliary_depth_of_field_textures,
                 )
                     .after(prepare_view_targets)
-                    .in_set(RenderSet::ManageViews),
+                    .in_set(RenderSystems::ManageViews),
             )
             .add_systems(
                 Render,
@@ -235,11 +238,11 @@ impl Plugin for DepthOfFieldPlugin {
                     prepare_depth_of_field_pipelines,
                 )
                     .chain()
-                    .in_set(RenderSet::Prepare),
+                    .in_set(RenderSystems::Prepare),
             )
             .add_systems(
                 Render,
-                prepare_depth_of_field_global_bind_group.in_set(RenderSet::PrepareBindGroups),
+                prepare_depth_of_field_global_bind_group.in_set(RenderSystems::PrepareBindGroups),
             )
             .add_render_graph_node::<ViewNodeRunner<DepthOfFieldNode>>(Core3d, Node3d::DepthOfField)
             .add_render_graph_edges(
@@ -380,7 +383,9 @@ impl ViewNode for DepthOfFieldNode {
                     auxiliary_dof_texture,
                     view_bind_group_layouts.dual_input.as_ref(),
                 ) else {
-                    warn_once!("Should have created the auxiliary depth of field texture by now");
+                    once!(warn!(
+                        "Should have created the auxiliary depth of field texture by now"
+                    ));
                     continue;
                 };
                 render_context.render_device().create_bind_group(
@@ -422,7 +427,9 @@ impl ViewNode for DepthOfFieldNode {
             // `prepare_auxiliary_depth_of_field_textures``.
             if pipeline_render_info.is_dual_output {
                 let Some(auxiliary_dof_texture) = auxiliary_dof_texture else {
-                    warn_once!("Should have created the auxiliary depth of field texture by now");
+                    once!(warn!(
+                        "Should have created the auxiliary depth of field texture by now"
+                    ));
                     continue;
                 };
                 color_attachments.push(Some(RenderPassColorAttachment {
@@ -803,6 +810,7 @@ impl SpecializedRenderPipeline for DepthOfFieldPipeline {
                 },
                 targets,
             }),
+            zero_initialize_workgroup_memory: false,
         }
     }
 }
@@ -810,19 +818,31 @@ impl SpecializedRenderPipeline for DepthOfFieldPipeline {
 /// Extracts all [`DepthOfField`] components into the render world.
 fn extract_depth_of_field_settings(
     mut commands: Commands,
-    mut query: Extract<Query<(&RenderEntity, &DepthOfField, &Projection)>>,
+    mut query: Extract<Query<(RenderEntity, &DepthOfField, &Projection)>>,
 ) {
     if !DEPTH_TEXTURE_SAMPLING_SUPPORTED {
-        info_once!(
+        once!(info!(
             "Disabling depth of field on this platform because depth textures aren't supported correctly"
-        );
+        ));
         return;
     }
 
     for (entity, depth_of_field, projection) in query.iter_mut() {
-        let entity = entity.id();
+        let mut entity_commands = commands
+            .get_entity(entity)
+            .expect("Depth of field entity wasn't synced.");
+
         // Depth of field is nonsensical without a perspective projection.
         let Projection::Perspective(ref perspective_projection) = *projection else {
+            // TODO: needs better strategy for cleaning up
+            entity_commands.remove::<(
+                DepthOfField,
+                DepthOfFieldUniform,
+                // components added in prepare systems (because `DepthOfFieldNode` does not query extracted components)
+                DepthOfFieldPipelines,
+                AuxiliaryDepthOfFieldTexture,
+                ViewDepthOfFieldBindGroupLayouts,
+            )>();
             continue;
         };
 
@@ -830,7 +850,7 @@ fn extract_depth_of_field_settings(
             calculate_focal_length(depth_of_field.sensor_height, perspective_projection.fov);
 
         // Convert `DepthOfField` to `DepthOfFieldUniform`.
-        commands.get_or_spawn(entity).insert((
+        entity_commands.insert((
             *depth_of_field,
             DepthOfFieldUniform {
                 focal_distance: depth_of_field.focal_distance,

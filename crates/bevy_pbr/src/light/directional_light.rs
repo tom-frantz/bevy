@@ -1,4 +1,4 @@
-use bevy_render::{view::Visibility, world_sync::SyncToRenderWorld};
+use bevy_render::view::{self, Visibility};
 
 use super::*;
 
@@ -41,16 +41,9 @@ use super::*;
 /// To modify the cascade setup, such as the number of cascades or the maximum shadow distance,
 /// change the [`CascadeShadowConfig`] component of the entity with the [`DirectionalLight`].
 ///
-/// To control the resolution of the shadow maps, use the [`DirectionalLightShadowMap`] resource:
-///
-/// ```
-/// # use bevy_app::prelude::*;
-/// # use bevy_pbr::DirectionalLightShadowMap;
-/// App::new()
-///     .insert_resource(DirectionalLightShadowMap { size: 2048 });
-/// ```
+/// To control the resolution of the shadow maps, use the [`DirectionalLightShadowMap`] resource.
 #[derive(Component, Debug, Clone, Reflect)]
-#[reflect(Component, Default, Debug)]
+#[reflect(Component, Default, Debug, Clone)]
 #[require(
     Cascades,
     CascadesFrusta,
@@ -58,8 +51,9 @@ use super::*;
     CascadesVisibleEntities,
     Transform,
     Visibility,
-    SyncToRenderWorld
+    VisibilityClass
 )]
+#[component(on_add = view::add_visibility_class::<LightVisibilityClass>)]
 pub struct DirectionalLight {
     /// The color of the light.
     ///
@@ -96,7 +90,20 @@ pub struct DirectionalLight {
     ///
     /// Note that soft shadows are significantly more expensive to render than
     /// hard shadows.
+    #[cfg(feature = "experimental_pbr_pcss")]
     pub soft_shadow_size: Option<f32>,
+
+    /// Whether this directional light contributes diffuse lighting to meshes
+    /// with lightmaps.
+    ///
+    /// Set this to false if your lightmap baking tool bakes the direct diffuse
+    /// light from this directional light into the lightmaps in order to avoid
+    /// counting the radiance from this light twice. Note that the specular
+    /// portion of the light is always considered, because Bevy currently has no
+    /// means to bake specular light.
+    ///
+    /// By default, this is set to true.
+    pub affects_lightmapped_mesh_diffuse: bool,
 
     /// A value that adjusts the tradeoff between self-shadowing artifacts and
     /// proximity of shadows to their casters.
@@ -121,9 +128,11 @@ impl Default for DirectionalLight {
             color: Color::WHITE,
             illuminance: light_consts::lux::AMBIENT_DAYLIGHT,
             shadows_enabled: false,
-            soft_shadow_size: None,
             shadow_depth_bias: Self::DEFAULT_SHADOW_DEPTH_BIAS,
             shadow_normal_bias: Self::DEFAULT_SHADOW_NORMAL_BIAS,
+            affects_lightmapped_mesh_diffuse: true,
+            #[cfg(feature = "experimental_pbr_pcss")]
+            soft_shadow_size: None,
         }
     }
 }

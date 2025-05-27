@@ -18,7 +18,11 @@ use bevy_reflect::{ReflectDeserialize, ReflectSerialize};
 /// will always have some nonempty interior.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "bevy_reflect", derive(Reflect), reflect(Debug, PartialEq))]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    derive(Reflect),
+    reflect(Debug, PartialEq, Clone)
+)]
 #[cfg_attr(
     all(feature = "serialize", feature = "bevy_reflect"),
     reflect(Serialize, Deserialize)
@@ -198,7 +202,10 @@ pub fn interval(start: f32, end: f32) -> Result<Interval, InvalidIntervalError> 
 
 #[cfg(test)]
 mod tests {
+    use crate::ops;
+
     use super::*;
+    use alloc::vec::Vec;
     use approx::{assert_abs_diff_eq, AbsDiffEq};
 
     #[test]
@@ -237,10 +244,10 @@ mod tests {
     #[test]
     fn lengths() {
         let ivl = interval(-5.0, 10.0).unwrap();
-        assert!((ivl.length() - 15.0).abs() <= f32::EPSILON);
+        assert!(ops::abs(ivl.length() - 15.0) <= f32::EPSILON);
 
         let ivl = interval(5.0, 100.0).unwrap();
-        assert!((ivl.length() - 95.0).abs() <= f32::EPSILON);
+        assert!(ops::abs(ivl.length() - 95.0) <= f32::EPSILON);
 
         let ivl = interval(0.0, f32::INFINITY).unwrap();
         assert_eq!(ivl.length(), f32::INFINITY);

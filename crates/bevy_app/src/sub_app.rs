@@ -1,15 +1,16 @@
 use crate::{App, AppLabel, InternedAppLabel, Plugin, Plugins, PluginsState};
+use alloc::{boxed::Box, string::String, vec::Vec};
 use bevy_ecs::{
     event::EventRegistry,
     prelude::*,
-    schedule::{InternedScheduleLabel, ScheduleBuildSettings, ScheduleLabel},
-    system::{SystemId, SystemInput},
+    schedule::{InternedScheduleLabel, InternedSystemSet, ScheduleBuildSettings, ScheduleLabel},
+    system::{ScheduleSystem, SystemId, SystemInput},
 };
+use bevy_platform::collections::{HashMap, HashSet};
+use core::fmt::Debug;
 
 #[cfg(feature = "trace")]
-use bevy_utils::tracing::info_span;
-use bevy_utils::{HashMap, HashSet};
-use core::fmt::Debug;
+use tracing::info_span;
 
 type ExtractFn = Box<dyn Fn(&mut World, &mut World) + Send>;
 
@@ -37,6 +38,7 @@ type ExtractFn = Box<dyn Fn(&mut World, &mut World) + Send>;
 ///
 /// // Create a sub-app with the same resource and a single schedule.
 /// let mut sub_app = SubApp::new();
+/// sub_app.update_schedule = Some(Main.intern());
 /// sub_app.insert_resource(Val(100));
 ///
 /// // Setup an extract function to copy the resource's value in the main world.
@@ -164,6 +166,35 @@ impl SubApp {
         self
     }
 
+    /// Take the function that will be called by [`extract`](Self::extract) out of the app, if any was set,
+    /// and replace it with `None`.
+    ///
+    /// If you use Bevy, `bevy_render` will set a default extract function used to extract data from
+    /// the main world into the render world as part of the Extract phase. In that case, you cannot replace
+    /// it with your own function. Instead, take the Bevy default function with this, and install your own
+    /// instead which calls the Bevy default.
+    ///
+    /// ```
+    /// # use bevy_app::SubApp;
+    /// # let mut app = SubApp::new();
+    /// let default_fn = app.take_extract();
+    /// app.set_extract(move |main, render| {
+    ///     // Do pre-extract custom logic
+    ///     // [...]
+    ///
+    ///     // Call Bevy's default, which executes the Extract phase
+    ///     if let Some(f) = default_fn.as_ref() {
+    ///         f(main, render);
+    ///     }
+    ///
+    ///     // Do post-extract custom logic
+    ///     // [...]
+    /// });
+    /// ```
+    pub fn take_extract(&mut self) -> Option<ExtractFn> {
+        self.extract.take()
+    }
+
     /// See [`App::insert_resource`].
     pub fn insert_resource<R: Resource>(&mut self, resource: R) -> &mut Self {
         self.world.insert_resource(resource);
@@ -180,7 +211,7 @@ impl SubApp {
     pub fn add_systems<M>(
         &mut self,
         schedule: impl ScheduleLabel,
-        systems: impl IntoSystemConfigs<M>,
+        systems: impl IntoScheduleConfigs<ScheduleSystem, M>,
     ) -> &mut Self {
         let mut schedules = self.world.resource_mut::<Schedules>();
         schedules.add_systems(schedule, systems);
@@ -202,10 +233,10 @@ impl SubApp {
 
     /// See [`App::configure_sets`].
     #[track_caller]
-    pub fn configure_sets(
+    pub fn configure_sets<M>(
         &mut self,
         schedule: impl ScheduleLabel,
-        sets: impl IntoSystemSetConfigs,
+        sets: impl IntoScheduleConfigs<InternedSystemSet, M>,
     ) -> &mut Self {
         let mut schedules = self.world.resource_mut::<Schedules>();
         schedules.configure_sets(schedule, sets);
